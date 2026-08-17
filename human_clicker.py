@@ -18,7 +18,7 @@ from tkinter import messagebox, ttk
 
 
 APP_NAME = "自然长按连点器"
-APP_VERSION = "1.2.1"
+APP_VERSION = "1.2.2"
 INJECTED_MARKER = 0xC0DEC11C
 SINGLE_INSTANCE_MUTEX = "Local\\NaturalHoldClicker.SingleInstance"
 ERROR_ALREADY_EXISTS = 183
@@ -75,7 +75,7 @@ class AppConfig:
             self,
             clicks_per_minute=max(30, min(3000, int(self.clicks_per_minute))),
             jitter_percent=max(0.0, min(50.0, float(self.jitter_percent))),
-            hold_threshold_ms=max(150, min(1500, int(self.hold_threshold_ms))),
+            hold_threshold_ms=max(60, min(1500, int(self.hold_threshold_ms))),
             trigger_button=self.trigger_button if self.trigger_button in BUTTON_LABELS else "left",
             injection_mode=self.injection_mode if self.injection_mode in INJECTION_LABELS else "sendinput",
             toggle_hotkey=self.toggle_hotkey if self.toggle_hotkey in HOTKEYS else "F8",
@@ -652,7 +652,14 @@ class App:
 
         self._setting_row(settings, 0, "点击频率", "每分钟 30–3000 次", self._spin(settings, self.cpm_var, 30, 3000, 10), "次/min")
         self._setting_row(settings, 1, "间隔波动", "以目标间隔为中心的随机范围", self._spin(settings, self.jitter_var, 0, 50, 1), "± %")
-        self._setting_row(settings, 2, "长按阈值", "短于该时间仍是普通单击", self._spin(settings, self.threshold_var, 150, 1500, 10), "ms")
+        self._setting_row(
+            settings,
+            2,
+            "长按阈值",
+            "60–149ms 响应更快，但可能把较慢单击判为长按",
+            self._spin(settings, self.threshold_var, 60, 1500, 10),
+            "ms",
+        )
 
         button_box = ttk.Combobox(settings, textvariable=self.button_var, values=list(BUTTON_LABELS.values()), state="readonly", width=13)
         self._setting_row(settings, 3, "触发按键", "建议使用左键；短按不会被改写", button_box, "")

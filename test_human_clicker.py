@@ -15,7 +15,7 @@ class ConfigTests(unittest.TestCase):
         ).validated()
         self.assertEqual(config.clicks_per_minute, 3000)
         self.assertEqual(config.jitter_percent, 0)
-        self.assertEqual(config.hold_threshold_ms, 150)
+        self.assertEqual(config.hold_threshold_ms, 60)
         self.assertEqual(config.injection_mode, "sendinput")
 
 
