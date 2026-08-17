@@ -6,10 +6,16 @@ from human_clicker import AppConfig, HumanRhythm
 
 class ConfigTests(unittest.TestCase):
     def test_validation_clamps_unsafe_values(self):
-        config = AppConfig(clicks_per_minute=99999, jitter_percent=-2, hold_threshold_ms=10).validated()
+        config = AppConfig(
+            clicks_per_minute=99999,
+            jitter_percent=-2,
+            hold_threshold_ms=10,
+            injection_mode="unknown",
+        ).validated()
         self.assertEqual(config.clicks_per_minute, 3000)
         self.assertEqual(config.jitter_percent, 0)
         self.assertEqual(config.hold_threshold_ms, 150)
+        self.assertEqual(config.injection_mode, "sendinput")
 
 
 class HumanRhythmTests(unittest.TestCase):

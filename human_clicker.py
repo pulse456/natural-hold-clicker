@@ -6,6 +6,7 @@ import math
 import os
 import queue
 import random
+import sys
 import threading
 import time
 import tkinter as tk
@@ -16,7 +17,7 @@ from tkinter import messagebox, ttk
 
 
 APP_NAME = "自然长按连点器"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
 INJECTED_MARKER = 0xC0DEC11C
 
 WM_LBUTTONDOWN = 0x0201
@@ -45,6 +46,12 @@ VK_F12 = 0x7B
 
 BUTTON_LABELS = {"left": "鼠标左键", "right": "鼠标右键", "middle": "鼠标中键"}
 LABEL_TO_BUTTON = {label: key for key, label in BUTTON_LABELS.items()}
+INJECTION_LABELS = {
+    "sendinput": "标准模式（推荐）",
+    "legacy": "游戏兼容模式",
+    "message": "窗口消息模式（旧游戏）",
+}
+LABEL_TO_INJECTION = {label: key for key, label in INJECTION_LABELS.items()}
 HOTKEYS = {f"F{i}": 0x6F + i for i in range(6, 12)}
 
 
@@ -54,6 +61,7 @@ class AppConfig:
     jitter_percent: float = 12.0
     hold_threshold_ms: int = 360
     trigger_button: str = "left"
+    injection_mode: str = "sendinput"
     toggle_hotkey: str = "F8"
     natural_rhythm: bool = True
     start_enabled: bool = True
@@ -65,6 +73,7 @@ class AppConfig:
             jitter_percent=max(0.0, min(50.0, float(self.jitter_percent))),
             hold_threshold_ms=max(150, min(1500, int(self.hold_threshold_ms))),
             trigger_button=self.trigger_button if self.trigger_button in BUTTON_LABELS else "left",
+            injection_mode=self.injection_mode if self.injection_mode in INJECTION_LABELS else "sendinput",
             toggle_hotkey=self.toggle_hotkey if self.toggle_hotkey in HOTKEYS else "F8",
             natural_rhythm=bool(self.natural_rhythm),
             start_enabled=bool(self.start_enabled),
@@ -175,6 +184,21 @@ if os.name == "nt":
 
     user32.SendInput.argtypes = (wintypes.UINT, ctypes.POINTER(INPUT), ctypes.c_int)
     user32.SendInput.restype = wintypes.UINT
+    user32.mouse_event.argtypes = (
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        ULONG_PTR,
+    )
+    user32.mouse_event.restype = None
+    user32.PostMessageW.argtypes = (wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM)
+    user32.PostMessageW.restype = wintypes.BOOL
+    user32.GetForegroundWindow.restype = wintypes.HWND
+    user32.GetCursorPos.argtypes = (ctypes.POINTER(wintypes.POINT),)
+    user32.GetCursorPos.restype = wintypes.BOOL
+    user32.ScreenToClient.argtypes = (wintypes.HWND, ctypes.POINTER(wintypes.POINT))
+    user32.ScreenToClient.restype = wintypes.BOOL
     user32.SetWindowsHookExW.argtypes = (
         ctypes.c_int,
         LOW_LEVEL_MOUSE_PROC,
@@ -200,9 +224,12 @@ if os.name == "nt":
     kernel32.GetCurrentThreadId.restype = wintypes.DWORD
 
 
-def send_mouse_flag(flag: int) -> bool:
+def send_mouse_flag(flag: int, mode: str = "sendinput") -> bool:
     if os.name != "nt":
         return False
+    if mode == "legacy":
+        user32.mouse_event(flag, 0, 0, 0, INJECTED_MARKER)
+        return True
     event = INPUT(type=0, mi=MOUSEINPUT(0, 0, 0, flag, 0, INJECTED_MARKER))
     return user32.SendInput(1, ctypes.byref(event), ctypes.sizeof(INPUT)) == 1
 
@@ -213,6 +240,39 @@ def button_flags(button: str) -> tuple[int, int]:
         "right": (MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP),
         "middle": (MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP),
     }[button]
+
+
+def send_button_event(button: str, down: bool, mode: str, target_window: int = 0) -> bool:
+    if mode != "message":
+        down_flag, up_flag = button_flags(button)
+        return send_mouse_flag(down_flag if down else up_flag, mode)
+
+    if os.name != "nt" or not target_window:
+        return False
+    message = {
+        ("left", True): WM_LBUTTONDOWN,
+        ("left", False): WM_LBUTTONUP,
+        ("right", True): WM_RBUTTONDOWN,
+        ("right", False): WM_RBUTTONUP,
+        ("middle", True): WM_MBUTTONDOWN,
+        ("middle", False): WM_MBUTTONUP,
+    }[(button, down)]
+    button_mask = {"left": 0x0001, "right": 0x0002, "middle": 0x0010}[button] if down else 0
+    point = wintypes.POINT()
+    if not user32.GetCursorPos(ctypes.byref(point)):
+        return False
+    user32.ScreenToClient(target_window, ctypes.byref(point))
+    packed_position = (point.x & 0xFFFF) | ((point.y & 0xFFFF) << 16)
+    return bool(user32.PostMessageW(target_window, message, button_mask, packed_position))
+
+
+def is_running_as_admin() -> bool:
+    if os.name != "nt":
+        return False
+    try:
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except OSError:
+        return False
 
 
 class ClickEngine:
@@ -226,6 +286,8 @@ class ClickEngine:
         self._cancel = threading.Event()
         self._rhythm = HumanRhythm()
         self._worker: threading.Thread | None = None
+        self._physical_presses = 0
+        self._generated_clicks = 0
 
     @property
     def enabled(self) -> bool:
@@ -239,9 +301,12 @@ class ClickEngine:
 
     def update_config(self, config: AppConfig) -> None:
         with self._lock:
-            button_changed = config.trigger_button != self._config.trigger_button
+            input_changed = (
+                config.trigger_button != self._config.trigger_button
+                or config.injection_mode != self._config.injection_mode
+            )
             self._config = config
-            if button_changed:
+            if input_changed:
                 self._press_token += 1
                 self._physically_held = False
                 self._cancel.set()
@@ -250,6 +315,8 @@ class ClickEngine:
         with self._lock:
             if button != self._config.trigger_button or self._physically_held:
                 return
+            self._physical_presses += 1
+            self._notify("stats", self._physical_presses, self._generated_clicks)
             self._physically_held = True
             self._press_token += 1
             token = self._press_token
@@ -298,12 +365,15 @@ class ClickEngine:
             return self._enabled and self._physically_held and token == self._press_token
 
     def _run_press(self, token: int, button: str) -> None:
-        threshold = self.config.hold_threshold_ms / 1000.0
+        initial_config = self.config
+        threshold = initial_config.hold_threshold_ms / 1000.0
         if self._cancel.wait(threshold) or not self._still_active(token):
             return
 
-        _, up_flag = button_flags(button)
-        send_mouse_flag(up_flag)  # Release the native held state before generating clicks.
+        target_window = user32.GetForegroundWindow() if initial_config.injection_mode == "message" else 0
+        send_button_event(
+            button, False, initial_config.injection_mode, target_window
+        )  # Release the native held state before generating clicks.
         if self._cancel.wait(0.018) or not self._still_active(token):
             return
         self._notify("clicking")
@@ -314,11 +384,17 @@ class ClickEngine:
             interval = self._rhythm.next_interval(
                 config.clicks_per_minute, config.jitter_percent, config.natural_rhythm
             )
-            down_flag, up_flag = button_flags(button)
-            send_mouse_flag(down_flag)
+            sent = send_button_event(button, True, config.injection_mode, target_window)
+            if sent:
+                with self._lock:
+                    self._generated_clicks += 1
+                    stats = (self._physical_presses, self._generated_clicks)
+                self._notify("stats", *stats)
             hold_time = self._rhythm.click_hold_time(interval, config.natural_rhythm)
             cancelled = self._cancel.wait(hold_time)
-            send_mouse_flag(up_flag)  # Always release, even when paused mid-click.
+            send_button_event(
+                button, False, config.injection_mode, target_window
+            )  # Always release, even when paused mid-click.
             if cancelled or not self._still_active(token):
                 break
             remaining = max(0.0, interval - (time.perf_counter() - started))
@@ -447,8 +523,8 @@ class App:
 
     def _build_window(self) -> None:
         self.root.title(f"{APP_NAME}  {APP_VERSION}")
-        self.root.geometry("620x620")
-        self.root.minsize(580, 590)
+        self.root.geometry("650x690")
+        self.root.minsize(610, 660)
         self.root.configure(bg=self.BG)
         try:
             self.root.iconbitmap(default="")
@@ -501,6 +577,7 @@ class App:
         self.jitter_var = tk.StringVar(value=f"{self.config.jitter_percent:g}")
         self.threshold_var = tk.StringVar(value=str(self.config.hold_threshold_ms))
         self.button_var = tk.StringVar(value=BUTTON_LABELS[self.config.trigger_button])
+        self.injection_var = tk.StringVar(value=INJECTION_LABELS[self.config.injection_mode])
         self.hotkey_var = tk.StringVar(value=self.config.toggle_hotkey)
         self.natural_var = tk.BooleanVar(value=self.config.natural_rhythm)
         self.start_var = tk.BooleanVar(value=self.config.start_enabled)
@@ -512,11 +589,20 @@ class App:
         button_box = ttk.Combobox(settings, textvariable=self.button_var, values=list(BUTTON_LABELS.values()), state="readonly", width=13)
         self._setting_row(settings, 3, "触发按键", "建议使用左键；短按不会被改写", button_box, "")
 
+        injection_box = ttk.Combobox(
+            settings,
+            textvariable=self.injection_var,
+            values=list(INJECTION_LABELS.values()),
+            state="readonly",
+            width=20,
+        )
+        self._setting_row(settings, 4, "输入模式", "FPS 无响应时依次尝试兼容和窗口消息", injection_box, "")
+
         hotkey_box = ttk.Combobox(settings, textvariable=self.hotkey_var, values=list(HOTKEYS), state="readonly", width=13)
-        self._setting_row(settings, 4, "暂停/继续", "全局快捷键；F12 始终紧急停止", hotkey_box, "")
+        self._setting_row(settings, 5, "暂停/继续", "全局快捷键；F12 始终紧急停止", hotkey_box, "")
 
         options = ttk.Frame(settings, style="Card.TFrame")
-        options.grid(row=5, column=0, columnspan=4, sticky="ew", pady=(14, 0))
+        options.grid(row=6, column=0, columnspan=4, sticky="ew", pady=(14, 0))
         ttk.Checkbutton(options, text="自然节奏（轻微漂移和低概率短停顿）", variable=self.natural_var).pack(anchor="w")
         ttk.Checkbutton(options, text="下次启动时自动启用", variable=self.start_var).pack(anchor="w", pady=(5, 0))
 
@@ -525,10 +611,22 @@ class App:
         self.feedback = ttk.Label(footer, text="", style="Subtitle.TLabel")
         self.feedback.pack(side="left")
         ttk.Button(footer, text="保存并应用", style="Primary.TButton", command=self.apply).pack(side="right")
+        if not is_running_as_admin():
+            ttk.Button(footer, text="管理员重启", command=self.restart_as_admin).pack(side="right", padx=(0, 8))
+
+        self.stats_label = ttk.Label(
+            outer,
+            text="输入诊断：检测到 0 次物理按下 · 已生成 0 次点击",
+            style="Subtitle.TLabel",
+        )
+        self.stats_label.pack(anchor="w", pady=(13, 0))
 
         safety = ttk.Label(
             outer,
-            text="安全机制：仅识别真实鼠标输入，程序生成的点击不会再次触发连点。\n暂停或松开鼠标时，会强制发送抬起事件，避免按键卡住。",
+            text=(
+                "安全机制：仅识别真实鼠标输入，程序生成的点击不会再次触发连点。\n"
+                f"暂停或松开会强制抬起按键 · 当前以{'管理员' if is_running_as_admin() else '普通'}权限运行。"
+            ),
             style="Subtitle.TLabel",
             justify="left",
         )
@@ -556,6 +654,10 @@ class App:
                 name, args = self.events.get_nowait()
                 if name in {"waiting", "paused", "clicking"}:
                     self._set_status(name, *(args[:1]))
+                elif name == "stats":
+                    self.stats_label.configure(
+                        text=f"输入诊断：检测到 {args[0]} 次物理按下 · 已生成 {args[1]} 次点击"
+                    )
                 elif name == "error":
                     self._set_status("error", args[0] if args else "发生未知错误。")
         except queue.Empty:
@@ -590,6 +692,7 @@ class App:
                 jitter_percent=float(self.jitter_var.get()),
                 hold_threshold_ms=int(self.threshold_var.get()),
                 trigger_button=LABEL_TO_BUTTON[self.button_var.get()],
+                injection_mode=LABEL_TO_INJECTION[self.injection_var.get()],
                 toggle_hotkey=self.hotkey_var.get(),
                 natural_rhythm=self.natural_var.get(),
                 start_enabled=self.start_var.get(),
@@ -614,6 +717,21 @@ class App:
         self.feedback.configure(text="设置已保存并立即生效")
         self.root.after(2500, lambda: self.feedback.configure(text=""))
         self._set_status("waiting" if self.engine.enabled else "paused")
+
+    def restart_as_admin(self) -> None:
+        if getattr(sys, "frozen", False):
+            executable = sys.executable
+            parameters = None
+        else:
+            executable = sys.executable
+            parameters = f'"{Path(__file__).resolve()}"'
+        result = ctypes.windll.shell32.ShellExecuteW(
+            None, "runas", executable, parameters, str(Path.cwd()), 1
+        )
+        if result > 32:
+            self.close()
+        else:
+            messagebox.showerror("无法提升权限", "管理员启动被取消或被系统阻止。")
 
     def close(self) -> None:
         self.engine.shutdown()
