@@ -6,6 +6,8 @@ Windows 图形化长按连点工具。普通短按完全按原样传递；按住
 
 可直接从项目的 **Releases** 页面下载 `自然长按连点器.exe`，无需安装 Python。
 
+仓库内也保留了当前稳定版：[下载 Windows x64 可执行文件](bin/natural-hold-clicker-windows-x64-v1.2.1.exe)。
+
 ## 使用
 
 1. 打开 `自然长按连点器.exe`。
