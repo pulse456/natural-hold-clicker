@@ -18,8 +18,10 @@ from tkinter import messagebox, ttk
 
 
 APP_NAME = "自然长按连点器"
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.2.1"
 INJECTED_MARKER = 0xC0DEC11C
+SINGLE_INSTANCE_MUTEX = "Local\\NaturalHoldClicker.SingleInstance"
+ERROR_ALREADY_EXISTS = 183
 
 WM_LBUTTONDOWN = 0x0201
 WM_LBUTTONUP = 0x0202
@@ -259,6 +261,10 @@ if os.name == "nt":
     user32.PostThreadMessageW.argtypes = (wintypes.DWORD, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM)
     user32.PostThreadMessageW.restype = wintypes.BOOL
     kernel32.GetCurrentThreadId.restype = wintypes.DWORD
+    kernel32.CreateMutexW.argtypes = (ctypes.c_void_p, wintypes.BOOL, wintypes.LPCWSTR)
+    kernel32.CreateMutexW.restype = wintypes.HANDLE
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    kernel32.CloseHandle.restype = wintypes.BOOL
 
 
 def send_mouse_flag(flag: int, mode: str = "sendinput") -> bool:
@@ -310,6 +316,21 @@ def is_running_as_admin() -> bool:
         return bool(ctypes.windll.shell32.IsUserAnAdmin())
     except OSError:
         return False
+
+
+class SingleInstanceGuard:
+    def __init__(self, name: str = SINGLE_INSTANCE_MUTEX) -> None:
+        self.handle = None
+        self.already_running = False
+        if os.name == "nt":
+            ctypes.set_last_error(0)
+            self.handle = kernel32.CreateMutexW(None, False, name)
+            self.already_running = bool(self.handle) and ctypes.get_last_error() == ERROR_ALREADY_EXISTS
+
+    def close(self) -> None:
+        if self.handle:
+            kernel32.CloseHandle(self.handle)
+            self.handle = None
 
 
 class ClickEngine:
@@ -515,6 +536,9 @@ class GlobalInputMonitor:
 
         toggle_ok = bool(user32.RegisterHotKey(None, HOTKEY_TOGGLE_ID, MOD_NOREPEAT, HOTKEYS[self._hotkey_name]))
         panic_ok = bool(user32.RegisterHotKey(None, HOTKEY_PANIC_ID, MOD_NOREPEAT, VK_F12))
+        if not (toggle_ok and panic_ok):
+            # Do not leave mouse injection armed when its safety hotkeys are unavailable.
+            self.engine.set_enabled(False, "hotkey_conflict")
         if not toggle_ok:
             self.notify("error", f"{self._hotkey_name} 已被其他程序占用，请换一个快捷键。")
         if not panic_ok:
@@ -547,8 +571,9 @@ class App:
     GREEN = "#188A64"
     RED = "#C23B47"
 
-    def __init__(self, root: tk.Tk) -> None:
+    def __init__(self, root: tk.Tk, instance_guard: SingleInstanceGuard | None = None) -> None:
         self.root = root
+        self.instance_guard = instance_guard
         self.config = load_config()
         self.events: queue.Queue[tuple[str, tuple]] = queue.Queue()
         self.sound_player = SoundPlayer()
@@ -772,27 +797,46 @@ class App:
         else:
             executable = sys.executable
             parameters = f'"{Path(__file__).resolve()}"'
+        # Release the single-instance lock before starting the elevated replacement.
+        if self.instance_guard:
+            self.instance_guard.close()
         result = ctypes.windll.shell32.ShellExecuteW(
             None, "runas", executable, parameters, str(Path.cwd()), 1
         )
         if result > 32:
             self.close()
         else:
+            self.instance_guard = SingleInstanceGuard()
             messagebox.showerror("无法提升权限", "管理员启动被取消或被系统阻止。")
 
     def close(self) -> None:
         self.engine.shutdown()
         self.monitor.stop()
         self.sound_player.close()
+        if self.instance_guard:
+            self.instance_guard.close()
         self.root.destroy()
 
 
 def main() -> None:
     if os.name != "nt":
         raise SystemExit("This application only supports Windows.")
-    root = tk.Tk()
-    App(root)
-    root.mainloop()
+    instance_guard = SingleInstanceGuard()
+    if instance_guard.already_running:
+        ctypes.windll.user32.MessageBoxW(
+            None,
+            "自然长按连点器已经在运行。请关闭旧窗口后再启动新版。",
+            APP_NAME,
+            0x30,
+        )
+        instance_guard.close()
+        return
+    try:
+        root = tk.Tk()
+        App(root, instance_guard)
+        root.mainloop()
+    finally:
+        instance_guard.close()
 
 
 if __name__ == "__main__":

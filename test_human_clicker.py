@@ -1,7 +1,8 @@
 import random
 import unittest
+import uuid
 
-from human_clicker import AppConfig, ClickEngine, HumanRhythm
+from human_clicker import AppConfig, ClickEngine, HumanRhythm, SingleInstanceGuard
 
 
 class ConfigTests(unittest.TestCase):
@@ -50,6 +51,19 @@ class SoundNotificationTests(unittest.TestCase):
         engine = ClickEngine(AppConfig(sound_enabled=False, start_enabled=True), lambda *args: events.append(args))
         engine.set_enabled(False, "hotkey")
         self.assertFalse(any(event[0] == "sound" for event in events))
+
+
+class SingleInstanceTests(unittest.TestCase):
+    def test_second_instance_is_detected(self):
+        mutex_name = f"Local\\NaturalHoldClicker.Test.{uuid.uuid4()}"
+        first = SingleInstanceGuard(mutex_name)
+        second = SingleInstanceGuard(mutex_name)
+        try:
+            self.assertFalse(first.already_running)
+            self.assertTrue(second.already_running)
+        finally:
+            second.close()
+            first.close()
 
 
 if __name__ == "__main__":
