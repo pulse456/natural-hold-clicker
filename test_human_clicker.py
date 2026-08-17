@@ -1,7 +1,7 @@
 import random
 import unittest
 
-from human_clicker import AppConfig, HumanRhythm
+from human_clicker import AppConfig, ClickEngine, HumanRhythm
 
 
 class ConfigTests(unittest.TestCase):
@@ -33,6 +33,23 @@ class HumanRhythmTests(unittest.TestCase):
         rhythm = HumanRhythm(random.Random(7))
         values = [rhythm.next_interval(3000, 50, True) for _ in range(5000)]
         self.assertTrue(all(value >= 0.008 for value in values))
+
+
+class SoundNotificationTests(unittest.TestCase):
+    def test_toggle_emits_distinct_sound_notifications(self):
+        events = []
+        engine = ClickEngine(AppConfig(sound_enabled=True, start_enabled=True), lambda *args: events.append(args))
+        engine.set_enabled(False, "hotkey")
+        engine.set_enabled(True, "hotkey")
+        engine.panic()
+        tones = [event[1] for event in events if event[0] == "sound"]
+        self.assertEqual(tones, ["disabled", "enabled", "panic"])
+
+    def test_sound_can_be_disabled(self):
+        events = []
+        engine = ClickEngine(AppConfig(sound_enabled=False, start_enabled=True), lambda *args: events.append(args))
+        engine.set_enabled(False, "hotkey")
+        self.assertFalse(any(event[0] == "sound" for event in events))
 
 
 if __name__ == "__main__":

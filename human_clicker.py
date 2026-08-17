@@ -10,6 +10,7 @@ import sys
 import threading
 import time
 import tkinter as tk
+import winsound
 from ctypes import wintypes
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
@@ -17,7 +18,7 @@ from tkinter import messagebox, ttk
 
 
 APP_NAME = "自然长按连点器"
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.0"
 INJECTED_MARKER = 0xC0DEC11C
 
 WM_LBUTTONDOWN = 0x0201
@@ -64,6 +65,7 @@ class AppConfig:
     injection_mode: str = "sendinput"
     toggle_hotkey: str = "F8"
     natural_rhythm: bool = True
+    sound_enabled: bool = True
     start_enabled: bool = True
 
     def validated(self) -> "AppConfig":
@@ -76,6 +78,7 @@ class AppConfig:
             injection_mode=self.injection_mode if self.injection_mode in INJECTION_LABELS else "sendinput",
             toggle_hotkey=self.toggle_hotkey if self.toggle_hotkey in HOTKEYS else "F8",
             natural_rhythm=bool(self.natural_rhythm),
+            sound_enabled=bool(self.sound_enabled),
             start_enabled=bool(self.start_enabled),
         )
 
@@ -140,6 +143,40 @@ class HumanRhythm:
         else:
             desired = 0.035
         return max(0.012, min(desired, interval * 0.42))
+
+
+class SoundPlayer:
+    """Serializes short status tones so rapid hotkey presses never overlap."""
+
+    TONES = {
+        "enabled": ((740, 55), (1040, 85)),
+        "disabled": ((650, 55), (420, 95)),
+        "panic": ((300, 180),),
+    }
+
+    def __init__(self) -> None:
+        self._queue: queue.Queue[str | None] = queue.Queue()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def play(self, tone: str) -> None:
+        if tone in self.TONES:
+            self._queue.put(tone)
+
+    def close(self) -> None:
+        self._queue.put(None)
+
+    def _run(self) -> None:
+        while True:
+            tone = self._queue.get()
+            if tone is None:
+                return
+            try:
+                for frequency, duration in self.TONES[tone]:
+                    winsound.Beep(frequency, duration)
+            except RuntimeError:
+                # Some audio drivers do not expose Beep; status changes still work normally.
+                pass
 
 
 ULONG_PTR = ctypes.c_size_t
@@ -345,7 +382,11 @@ class ClickEngine:
             self._enabled = enabled
             self._press_token += 1
             self._cancel.set()
+            sound_enabled = self._config.sound_enabled
         self._notify("waiting" if enabled else "paused", source)
+        if sound_enabled:
+            tone = "enabled" if enabled else ("panic" if source == "panic" else "disabled")
+            self._notify("sound", tone)
 
     def toggle(self, source: str = "hotkey") -> None:
         self.set_enabled(not self.enabled, source)
@@ -510,6 +551,7 @@ class App:
         self.root = root
         self.config = load_config()
         self.events: queue.Queue[tuple[str, tuple]] = queue.Queue()
+        self.sound_player = SoundPlayer()
         self.engine = ClickEngine(self.config, self.post_event)
         self.monitor = GlobalInputMonitor(self.engine, self.post_event)
         self._status = "waiting" if self.config.start_enabled else "paused"
@@ -580,6 +622,7 @@ class App:
         self.injection_var = tk.StringVar(value=INJECTION_LABELS[self.config.injection_mode])
         self.hotkey_var = tk.StringVar(value=self.config.toggle_hotkey)
         self.natural_var = tk.BooleanVar(value=self.config.natural_rhythm)
+        self.sound_var = tk.BooleanVar(value=self.config.sound_enabled)
         self.start_var = tk.BooleanVar(value=self.config.start_enabled)
 
         self._setting_row(settings, 0, "点击频率", "每分钟 30–3000 次", self._spin(settings, self.cpm_var, 30, 3000, 10), "次/min")
@@ -604,6 +647,7 @@ class App:
         options = ttk.Frame(settings, style="Card.TFrame")
         options.grid(row=6, column=0, columnspan=4, sticky="ew", pady=(14, 0))
         ttk.Checkbutton(options, text="自然节奏（轻微漂移和低概率短停顿）", variable=self.natural_var).pack(anchor="w")
+        ttk.Checkbutton(options, text="状态提示音（开启升调、暂停降调）", variable=self.sound_var).pack(anchor="w", pady=(5, 0))
         ttk.Checkbutton(options, text="下次启动时自动启用", variable=self.start_var).pack(anchor="w", pady=(5, 0))
 
         footer = ttk.Frame(outer)
@@ -658,6 +702,8 @@ class App:
                     self.stats_label.configure(
                         text=f"输入诊断：检测到 {args[0]} 次物理按下 · 已生成 {args[1]} 次点击"
                     )
+                elif name == "sound":
+                    self.sound_player.play(args[0])
                 elif name == "error":
                     self._set_status("error", args[0] if args else "发生未知错误。")
         except queue.Empty:
@@ -695,6 +741,7 @@ class App:
                 injection_mode=LABEL_TO_INJECTION[self.injection_var.get()],
                 toggle_hotkey=self.hotkey_var.get(),
                 natural_rhythm=self.natural_var.get(),
+                sound_enabled=self.sound_var.get(),
                 start_enabled=self.start_var.get(),
             )
             validated = new_config.validated()
@@ -736,6 +783,7 @@ class App:
     def close(self) -> None:
         self.engine.shutdown()
         self.monitor.stop()
+        self.sound_player.close()
         self.root.destroy()
 
 
