@@ -18,7 +18,7 @@ from tkinter import messagebox, ttk
 
 
 APP_NAME = "自然长按连点器"
-APP_VERSION = "1.2.2"
+APP_VERSION = "1.3.0"
 INJECTED_MARKER = 0xC0DEC11C
 SINGLE_INSTANCE_MUTEX = "Local\\NaturalHoldClicker.SingleInstance"
 ERROR_ALREADY_EXISTS = 183
@@ -49,6 +49,13 @@ VK_F12 = 0x7B
 
 BUTTON_LABELS = {"left": "鼠标左键", "right": "鼠标右键", "middle": "鼠标中键"}
 LABEL_TO_BUTTON = {label: key for key, label in BUTTON_LABELS.items()}
+ACTIVATION_LABELS = {
+    "stable": "稳定长按",
+    "progressive": "渐进连点（推荐 FPS）",
+    "rapid": "极速触发",
+    "tap_all": "即时点按（全部转换）",
+}
+LABEL_TO_ACTIVATION = {label: key for key, label in ACTIVATION_LABELS.items()}
 INJECTION_LABELS = {
     "sendinput": "标准模式（推荐）",
     "legacy": "游戏兼容模式",
@@ -64,6 +71,7 @@ class AppConfig:
     jitter_percent: float = 12.0
     hold_threshold_ms: int = 360
     trigger_button: str = "left"
+    activation_mode: str = "stable"
     injection_mode: str = "sendinput"
     toggle_hotkey: str = "F8"
     natural_rhythm: bool = True
@@ -77,6 +85,7 @@ class AppConfig:
             jitter_percent=max(0.0, min(50.0, float(self.jitter_percent))),
             hold_threshold_ms=max(60, min(1500, int(self.hold_threshold_ms))),
             trigger_button=self.trigger_button if self.trigger_button in BUTTON_LABELS else "left",
+            activation_mode=self.activation_mode if self.activation_mode in ACTIVATION_LABELS else "stable",
             injection_mode=self.injection_mode if self.injection_mode in INJECTION_LABELS else "sendinput",
             toggle_hotkey=self.toggle_hotkey if self.toggle_hotkey in HOTKEYS else "F8",
             natural_rhythm=bool(self.natural_rhythm),
@@ -145,6 +154,13 @@ class HumanRhythm:
         else:
             desired = 0.035
         return max(0.012, min(desired, interval * 0.42))
+
+    def fast_tap_hold_time(self, interval: float, natural: bool) -> float:
+        if natural:
+            desired = self.rng.triangular(0.020, 0.040, 0.028)
+        else:
+            desired = 0.027
+        return max(0.014, min(desired, interval * 0.38))
 
 
 class SoundPlayer:
@@ -346,6 +362,9 @@ class ClickEngine:
         self._worker: threading.Thread | None = None
         self._physical_presses = 0
         self._generated_clicks = 0
+        self._suppress_current_press = False
+        self._tap_owner_token: int | None = None
+        self._tap_owner_event: tuple[str, str, int] | None = None
 
     @property
     def enabled(self) -> bool:
@@ -361,40 +380,69 @@ class ClickEngine:
         with self._lock:
             input_changed = (
                 config.trigger_button != self._config.trigger_button
+                or config.activation_mode != self._config.activation_mode
                 or config.injection_mode != self._config.injection_mode
             )
             self._config = config
             if input_changed:
                 self._press_token += 1
                 self._physically_held = False
+                self._suppress_current_press = False
                 self._cancel.set()
 
-    def physical_down(self, button: str) -> None:
+    def physical_down(self, button: str) -> bool:
         with self._lock:
             if button != self._config.trigger_button or self._physically_held:
-                return
+                return False
             self._physical_presses += 1
             self._notify("stats", self._physical_presses, self._generated_clicks)
             self._physically_held = True
+            self._suppress_current_press = False
             self._press_token += 1
             token = self._press_token
             self._cancel = threading.Event()
             if not self._enabled:
-                return
+                return False
             config = self._config
+            cancel_event = self._cancel
+            pressed_at = time.perf_counter()
+            target_window = user32.GetForegroundWindow() if config.injection_mode == "message" else 0
+
+            if config.activation_mode == "tap_all":
+                sent = self._start_owned_tap(token, config, target_window)
+                if not sent:
+                    return False
+                self._suppress_current_press = True
+                self._generated_clicks += 1
+                self._notify("stats", self._physical_presses, self._generated_clicks)
+                self._notify("clicking")
+                self._worker = threading.Thread(
+                    target=self._run_tap_press,
+                    args=(token, config, target_window, cancel_event, pressed_at),
+                    daemon=True,
+                )
+                self._worker.start()
+                return True
+
             self._worker = threading.Thread(
-                target=self._run_press, args=(token, config.trigger_button), daemon=True
+                target=self._run_press,
+                args=(token, config, target_window, cancel_event, pressed_at),
+                daemon=True,
             )
             self._worker.start()
+            return False
 
-    def physical_up(self, button: str) -> None:
+    def physical_up(self, button: str) -> bool:
         with self._lock:
             if button != self._config.trigger_button:
-                return
+                return False
+            suppress = self._suppress_current_press
+            self._suppress_current_press = False
             self._physically_held = False
             self._press_token += 1
             self._cancel.set()
         self._notify("waiting" if self.enabled else "paused")
+        return suppress
 
     def set_enabled(self, enabled: bool, source: str = "ui") -> None:
         with self._lock:
@@ -404,6 +452,8 @@ class ClickEngine:
             self._press_token += 1
             self._cancel.set()
             sound_enabled = self._config.sound_enabled
+        if not enabled:
+            self._release_owned_tap()
         self._notify("waiting" if enabled else "paused", source)
         if sound_enabled:
             tone = "enabled" if enabled else ("panic" if source == "panic" else "disabled")
@@ -419,26 +469,151 @@ class ClickEngine:
         with self._lock:
             self._enabled = False
             self._physically_held = False
+            self._suppress_current_press = False
             self._press_token += 1
             self._cancel.set()
+        self._release_owned_tap()
 
     def _still_active(self, token: int) -> bool:
         with self._lock:
             return self._enabled and self._physically_held and token == self._press_token
 
-    def _run_press(self, token: int, button: str) -> None:
-        initial_config = self.config
-        threshold = initial_config.hold_threshold_ms / 1000.0
-        if self._cancel.wait(threshold) or not self._still_active(token):
+    def _record_generated_click(self) -> None:
+        with self._lock:
+            self._generated_clicks += 1
+            stats = (self._physical_presses, self._generated_clicks)
+        self._notify("stats", *stats)
+
+    def _start_owned_tap(
+        self, token: int, config: AppConfig, target_window: int
+    ) -> bool:
+        with self._lock:
+            if self._tap_owner_event is not None:
+                old_button, old_mode, old_window = self._tap_owner_event
+                send_button_event(old_button, False, old_mode, old_window)
+                self._tap_owner_token = None
+                self._tap_owner_event = None
+            sent = send_button_event(
+                config.trigger_button, True, config.injection_mode, target_window
+            )
+            if sent:
+                self._tap_owner_token = token
+                self._tap_owner_event = (
+                    config.trigger_button,
+                    config.injection_mode,
+                    target_window,
+                )
+            return sent
+
+    def _release_owned_tap(self, token: int | None = None) -> bool:
+        with self._lock:
+            if self._tap_owner_event is None:
+                return False
+            if token is not None and self._tap_owner_token != token:
+                return False
+            button, mode, target_window = self._tap_owner_event
+            self._tap_owner_token = None
+            self._tap_owner_event = None
+            return send_button_event(button, False, mode, target_window)
+
+    def _wait_click_hold(
+        self,
+        cancel_event: threading.Event,
+        hold_time: float,
+        finish_on_physical_release: bool,
+    ) -> bool:
+        started = time.perf_counter()
+        cancelled = cancel_event.wait(hold_time)
+        if cancelled and finish_on_physical_release:
+            with self._lock:
+                released_normally = self._enabled and not self._physically_held
+            remaining = hold_time - (time.perf_counter() - started)
+            if released_normally and remaining > 0:
+                time.sleep(remaining)
+        return cancelled
+
+    def _run_press(
+        self,
+        token: int,
+        initial_config: AppConfig,
+        target_window: int,
+        cancel_event: threading.Event,
+        pressed_at: float,
+    ) -> None:
+        if initial_config.activation_mode == "stable":
+            confirmation_delay = initial_config.hold_threshold_ms / 1000.0
+        elif initial_config.activation_mode == "progressive":
+            confirmation_delay = 0.050
+        else:  # rapid
+            confirmation_delay = 0.030
+
+        if cancel_event.wait(confirmation_delay) or not self._still_active(token):
             return
 
-        target_window = user32.GetForegroundWindow() if initial_config.injection_mode == "message" else 0
         send_button_event(
-            button, False, initial_config.injection_mode, target_window
+            initial_config.trigger_button, False, initial_config.injection_mode, target_window
         )  # Release the native held state before generating clicks.
-        if self._cancel.wait(0.018) or not self._still_active(token):
-            return
+
+        if initial_config.activation_mode == "progressive":
+            base_interval = 60.0 / initial_config.clicks_per_minute
+            first_repeat_at = max(confirmation_delay + 0.008, base_interval * 1.60)
+            remaining = max(0.0, first_repeat_at - (time.perf_counter() - pressed_at))
+            if cancel_event.wait(remaining) or not self._still_active(token):
+                return
+        else:
+            transition_gap = 0.018 if initial_config.activation_mode == "stable" else 0.005
+            if cancel_event.wait(transition_gap) or not self._still_active(token):
+                return
         self._notify("clicking")
+
+        progressive_started = time.perf_counter()
+        while self._still_active(token):
+            started = time.perf_counter()
+            config = self.config
+            interval = self._rhythm.next_interval(
+                config.clicks_per_minute, config.jitter_percent, config.natural_rhythm
+            )
+            if initial_config.activation_mode == "progressive":
+                ramp = max(0.0, 1.0 - (started - progressive_started) / 0.350)
+                interval *= 1.0 + 0.65 * ramp
+            sent = send_button_event(
+                initial_config.trigger_button, True, initial_config.injection_mode, target_window
+            )
+            if sent:
+                self._record_generated_click()
+            hold_time = self._rhythm.click_hold_time(interval, config.natural_rhythm)
+            cancelled = cancel_event.wait(hold_time)
+            send_button_event(
+                initial_config.trigger_button, False, initial_config.injection_mode, target_window
+            )  # Always release, even when paused mid-click.
+            if cancelled or not self._still_active(token):
+                break
+            remaining = max(0.0, interval - (time.perf_counter() - started))
+            if cancel_event.wait(remaining):
+                break
+
+    def _run_tap_press(
+        self,
+        token: int,
+        initial_config: AppConfig,
+        target_window: int,
+        cancel_event: threading.Event,
+        first_started: float,
+    ) -> None:
+        interval = self._rhythm.next_interval(
+            initial_config.clicks_per_minute,
+            initial_config.jitter_percent,
+            initial_config.natural_rhythm,
+        )
+        hold_time = self._rhythm.fast_tap_hold_time(interval, initial_config.natural_rhythm)
+        cancelled = self._wait_click_hold(cancel_event, hold_time, finish_on_physical_release=True)
+        self._release_owned_tap(token)
+        if cancelled or not self._still_active(token):
+            return
+
+        remaining = max(0.0, interval - (time.perf_counter() - first_started))
+        if cancel_event.wait(remaining):
+            return
 
         while self._still_active(token):
             started = time.perf_counter()
@@ -446,21 +621,18 @@ class ClickEngine:
             interval = self._rhythm.next_interval(
                 config.clicks_per_minute, config.jitter_percent, config.natural_rhythm
             )
-            sent = send_button_event(button, True, config.injection_mode, target_window)
+            sent = self._start_owned_tap(token, initial_config, target_window)
             if sent:
-                with self._lock:
-                    self._generated_clicks += 1
-                    stats = (self._physical_presses, self._generated_clicks)
-                self._notify("stats", *stats)
-            hold_time = self._rhythm.click_hold_time(interval, config.natural_rhythm)
-            cancelled = self._cancel.wait(hold_time)
-            send_button_event(
-                button, False, config.injection_mode, target_window
-            )  # Always release, even when paused mid-click.
+                self._record_generated_click()
+            hold_time = self._rhythm.fast_tap_hold_time(interval, config.natural_rhythm)
+            cancelled = self._wait_click_hold(
+                cancel_event, hold_time, finish_on_physical_release=True
+            )
+            self._release_owned_tap(token)
             if cancelled or not self._still_active(token):
                 break
             remaining = max(0.0, interval - (time.perf_counter() - started))
-            if self._cancel.wait(remaining):
+            if cancel_event.wait(remaining):
                 break
 
 
@@ -521,9 +693,11 @@ class GlobalInputMonitor:
                     if mapped:
                         button, down = mapped
                         if down:
-                            self.engine.physical_down(button)
+                            suppress = self.engine.physical_down(button)
                         else:
-                            self.engine.physical_up(button)
+                            suppress = self.engine.physical_up(button)
+                        if suppress:
+                            return 1
             return user32.CallNextHookEx(self._hook, code, w_param, l_param)
 
         self._callback = LOW_LEVEL_MOUSE_PROC(low_level_proc)
@@ -590,8 +764,8 @@ class App:
 
     def _build_window(self) -> None:
         self.root.title(f"{APP_NAME}  {APP_VERSION}")
-        self.root.geometry("650x690")
-        self.root.minsize(610, 660)
+        self.root.geometry("700x800")
+        self.root.minsize(670, 650)
         self.root.configure(bg=self.BG)
         try:
             self.root.iconbitmap(default="")
@@ -616,13 +790,30 @@ class App:
         style.configure("TSpinbox", padding=6)
 
     def _build_ui(self) -> None:
-        outer = ttk.Frame(self.root, padding=(28, 22))
-        outer.pack(fill="both", expand=True)
+        body = ttk.Frame(self.root)
+        body.pack(fill="both", expand=True)
+        self.canvas = tk.Canvas(body, background=self.BG, highlightthickness=0, borderwidth=0)
+        scrollbar = ttk.Scrollbar(body, orient="vertical", command=self.canvas.yview)
+        self.canvas.configure(yscrollcommand=scrollbar.set)
+        scrollbar.pack(side="right", fill="y")
+        self.canvas.pack(side="left", fill="both", expand=True)
+
+        outer = ttk.Frame(self.canvas, padding=(28, 22))
+        self.canvas_window = self.canvas.create_window((0, 0), window=outer, anchor="nw")
+        outer.bind(
+            "<Configure>",
+            lambda _event: self.canvas.configure(scrollregion=self.canvas.bbox("all")),
+        )
+        self.canvas.bind(
+            "<Configure>",
+            lambda event: self.canvas.itemconfigure(self.canvas_window, width=event.width),
+        )
+        self.root.bind_all("<MouseWheel>", self._on_mousewheel)
 
         ttk.Label(outer, text="自然长按连点器", style="Title.TLabel").pack(anchor="w")
         ttk.Label(
             outer,
-            text="短按保持原样；长按达到阈值后，转换为带自然波动的连续点击。",
+            text="四种触发策略，将鼠标按住转换为带自然波动的连续点击。",
             style="Subtitle.TLabel",
         ).pack(anchor="w", pady=(3, 16))
 
@@ -644,6 +835,7 @@ class App:
         self.jitter_var = tk.StringVar(value=f"{self.config.jitter_percent:g}")
         self.threshold_var = tk.StringVar(value=str(self.config.hold_threshold_ms))
         self.button_var = tk.StringVar(value=BUTTON_LABELS[self.config.trigger_button])
+        self.activation_var = tk.StringVar(value=ACTIVATION_LABELS[self.config.activation_mode])
         self.injection_var = tk.StringVar(value=INJECTION_LABELS[self.config.injection_mode])
         self.hotkey_var = tk.StringVar(value=self.config.toggle_hotkey)
         self.natural_var = tk.BooleanVar(value=self.config.natural_rhythm)
@@ -656,13 +848,22 @@ class App:
             settings,
             2,
             "长按阈值",
-            "60–149ms 响应更快，但可能把较慢单击判为长按",
+            "仅稳定长按使用；60–149ms 更快但更易误触",
             self._spin(settings, self.threshold_var, 60, 1500, 10),
             "ms",
         )
 
+        activation_box = ttk.Combobox(
+            settings,
+            textvariable=self.activation_var,
+            values=list(ACTIVATION_LABELS.values()),
+            state="readonly",
+            width=20,
+        )
+        self._setting_row(settings, 3, "触发策略", "渐进由慢到快；即时点按接管所有点击", activation_box, "")
+
         button_box = ttk.Combobox(settings, textvariable=self.button_var, values=list(BUTTON_LABELS.values()), state="readonly", width=13)
-        self._setting_row(settings, 3, "触发按键", "建议使用左键；短按不会被改写", button_box, "")
+        self._setting_row(settings, 4, "触发按键", "即时点按启用时，所有该按键操作都会被转换", button_box, "")
 
         injection_box = ttk.Combobox(
             settings,
@@ -671,13 +872,13 @@ class App:
             state="readonly",
             width=20,
         )
-        self._setting_row(settings, 4, "输入模式", "FPS 无响应时依次尝试兼容和窗口消息", injection_box, "")
+        self._setting_row(settings, 5, "输入模式", "FPS 无响应时依次尝试兼容和窗口消息", injection_box, "")
 
         hotkey_box = ttk.Combobox(settings, textvariable=self.hotkey_var, values=list(HOTKEYS), state="readonly", width=13)
-        self._setting_row(settings, 5, "暂停/继续", "全局快捷键；F12 始终紧急停止", hotkey_box, "")
+        self._setting_row(settings, 6, "暂停/继续", "全局快捷键；F12 始终紧急停止", hotkey_box, "")
 
         options = ttk.Frame(settings, style="Card.TFrame")
-        options.grid(row=6, column=0, columnspan=4, sticky="ew", pady=(14, 0))
+        options.grid(row=7, column=0, columnspan=4, sticky="ew", pady=(14, 0))
         ttk.Checkbutton(options, text="自然节奏（轻微漂移和低概率短停顿）", variable=self.natural_var).pack(anchor="w")
         ttk.Checkbutton(options, text="状态提示音（开启升调、暂停降调）", variable=self.sound_var).pack(anchor="w", pady=(5, 0))
         ttk.Checkbutton(options, text="下次启动时自动启用", variable=self.start_var).pack(anchor="w", pady=(5, 0))
@@ -708,6 +909,9 @@ class App:
         )
         safety.pack(anchor="w", pady=(16, 0))
         self._set_status(self._status)
+
+    def _on_mousewheel(self, event) -> None:
+        self.canvas.yview_scroll(int(-event.delta / 120), "units")
 
     def _spin(self, parent, variable, start, end, increment):
         return ttk.Spinbox(parent, textvariable=variable, from_=start, to=end, increment=increment, width=11, justify="right")
@@ -770,6 +974,7 @@ class App:
                 jitter_percent=float(self.jitter_var.get()),
                 hold_threshold_ms=int(self.threshold_var.get()),
                 trigger_button=LABEL_TO_BUTTON[self.button_var.get()],
+                activation_mode=LABEL_TO_ACTIVATION[self.activation_var.get()],
                 injection_mode=LABEL_TO_INJECTION[self.injection_var.get()],
                 toggle_hotkey=self.hotkey_var.get(),
                 natural_rhythm=self.natural_var.get(),
