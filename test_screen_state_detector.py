@@ -38,7 +38,7 @@ class RecognitionTests(unittest.TestCase):
     def test_mouse_samples_have_a_clear_margin(self):
         positives = [
             mouse_left_score(gray(path), self.mouse_templates)
-            for path in SAMPLES.glob("mouse_pos_previous_*.png")
+            for path in SAMPLES.glob("mouse_pos_*.png")
         ]
         negatives = [
             mouse_left_score(gray(path), self.mouse_templates)

@@ -15,7 +15,7 @@ from PIL import ImageGrab
 REF_W, REF_H = 1920, 1080
 REGION_MOUSE = (1864, 500, 38, 260)
 REGION_CLOCK = (1806, 15, 41, 46)
-THRESH_MOUSE = 0.70
+THRESH_MOUSE = 0.62
 THRESH_CLOCK = 0.50
 CLEAR_MARGIN = 0.08
 CLEAR_FRAMES = 2
@@ -24,6 +24,7 @@ CHECK_INTERVAL = 0.025
 MOUSE_TEMPLATE_FILES = (
     "template_mouse_left_3.png",
     "template_mouse_left_4.png",
+    "template_mouse_left_5.png",
 )
 
 
