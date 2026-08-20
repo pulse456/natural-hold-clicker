@@ -16,9 +16,11 @@ from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from tkinter import messagebox, ttk
 
+from screen_state_detector import ScreenStateDetector, make_dpi_aware
+
 
 APP_NAME = "自然长按连点器"
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.4.0"
 INJECTED_MARKER = 0xC0DEC11C
 SINGLE_INSTANCE_MUTEX = "Local\\NaturalHoldClicker.SingleInstance"
 ERROR_ALREADY_EXISTS = 183
@@ -52,8 +54,6 @@ LABEL_TO_BUTTON = {label: key for key, label in BUTTON_LABELS.items()}
 ACTIVATION_LABELS = {
     "stable": "稳定长按",
     "progressive": "渐进连点（推荐 FPS）",
-    "rapid": "极速触发",
-    "tap_all": "即时点按（全部转换）",
 }
 LABEL_TO_ACTIVATION = {label: key for key, label in ACTIVATION_LABELS.items()}
 INJECTION_LABELS = {
@@ -76,6 +76,7 @@ class AppConfig:
     toggle_hotkey: str = "F8"
     natural_rhythm: bool = True
     sound_enabled: bool = True
+    screen_guard_enabled: bool = False
     start_enabled: bool = True
 
     def validated(self) -> "AppConfig":
@@ -83,13 +84,14 @@ class AppConfig:
             self,
             clicks_per_minute=max(30, min(3000, int(self.clicks_per_minute))),
             jitter_percent=max(0.0, min(50.0, float(self.jitter_percent))),
-            hold_threshold_ms=max(60, min(1500, int(self.hold_threshold_ms))),
+            hold_threshold_ms=max(30, min(1500, int(self.hold_threshold_ms))),
             trigger_button=self.trigger_button if self.trigger_button in BUTTON_LABELS else "left",
             activation_mode=self.activation_mode if self.activation_mode in ACTIVATION_LABELS else "stable",
             injection_mode=self.injection_mode if self.injection_mode in INJECTION_LABELS else "sendinput",
             toggle_hotkey=self.toggle_hotkey if self.toggle_hotkey in HOTKEYS else "F8",
             natural_rhythm=bool(self.natural_rhythm),
             sound_enabled=bool(self.sound_enabled),
+            screen_guard_enabled=bool(self.screen_guard_enabled),
             start_enabled=bool(self.start_enabled),
         )
 
@@ -97,6 +99,11 @@ class AppConfig:
 def config_path() -> Path:
     base = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "NaturalHoldClicker"
     return base / "config.json"
+
+
+def bundled_path(name: str) -> Path:
+    base = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+    return base / name
 
 
 def load_config() -> AppConfig:
@@ -154,14 +161,6 @@ class HumanRhythm:
         else:
             desired = 0.035
         return max(0.012, min(desired, interval * 0.42))
-
-    def fast_tap_hold_time(self, interval: float, natural: bool) -> float:
-        if natural:
-            desired = self.rng.triangular(0.020, 0.040, 0.028)
-        else:
-            desired = 0.027
-        return max(0.014, min(desired, interval * 0.38))
-
 
 class SoundPlayer:
     """Serializes short status tones so rapid hotkey presses never overlap."""
@@ -362,9 +361,8 @@ class ClickEngine:
         self._worker: threading.Thread | None = None
         self._physical_presses = 0
         self._generated_clicks = 0
-        self._suppress_current_press = False
-        self._tap_owner_token: int | None = None
-        self._tap_owner_event: tuple[str, str, int] | None = None
+        self._screen_blocked = False
+        self._screen_block_reason = ""
 
     @property
     def enabled(self) -> bool:
@@ -375,6 +373,11 @@ class ClickEngine:
     def config(self) -> AppConfig:
         with self._lock:
             return self._config
+
+    @property
+    def screen_block(self) -> tuple[bool, str]:
+        with self._lock:
+            return self._screen_blocked, self._screen_block_reason
 
     def update_config(self, config: AppConfig) -> None:
         with self._lock:
@@ -387,7 +390,6 @@ class ClickEngine:
             if input_changed:
                 self._press_token += 1
                 self._physically_held = False
-                self._suppress_current_press = False
                 self._cancel.set()
 
     def physical_down(self, button: str) -> bool:
@@ -397,32 +399,15 @@ class ClickEngine:
             self._physical_presses += 1
             self._notify("stats", self._physical_presses, self._generated_clicks)
             self._physically_held = True
-            self._suppress_current_press = False
             self._press_token += 1
             token = self._press_token
             self._cancel = threading.Event()
-            if not self._enabled:
+            if not self._enabled or self._screen_blocked:
                 return False
             config = self._config
             cancel_event = self._cancel
             pressed_at = time.perf_counter()
             target_window = user32.GetForegroundWindow() if config.injection_mode == "message" else 0
-
-            if config.activation_mode == "tap_all":
-                sent = self._start_owned_tap(token, config, target_window)
-                if not sent:
-                    return False
-                self._suppress_current_press = True
-                self._generated_clicks += 1
-                self._notify("stats", self._physical_presses, self._generated_clicks)
-                self._notify("clicking")
-                self._worker = threading.Thread(
-                    target=self._run_tap_press,
-                    args=(token, config, target_window, cancel_event, pressed_at),
-                    daemon=True,
-                )
-                self._worker.start()
-                return True
 
             self._worker = threading.Thread(
                 target=self._run_press,
@@ -436,13 +421,14 @@ class ClickEngine:
         with self._lock:
             if button != self._config.trigger_button:
                 return False
-            suppress = self._suppress_current_press
-            self._suppress_current_press = False
             self._physically_held = False
             self._press_token += 1
             self._cancel.set()
-        self._notify("waiting" if self.enabled else "paused")
-        return suppress
+            state = "guarded" if self._enabled and self._screen_blocked else (
+                "waiting" if self._enabled else "paused"
+            )
+        self._notify(state)
+        return False
 
     def set_enabled(self, enabled: bool, source: str = "ui") -> None:
         with self._lock:
@@ -452,9 +438,10 @@ class ClickEngine:
             self._press_token += 1
             self._cancel.set()
             sound_enabled = self._config.sound_enabled
-        if not enabled:
-            self._release_owned_tap()
-        self._notify("waiting" if enabled else "paused", source)
+            state = "guarded" if enabled and self._screen_blocked else (
+                "waiting" if enabled else "paused"
+            )
+        self._notify(state, source)
         if sound_enabled:
             tone = "enabled" if enabled else ("panic" if source == "panic" else "disabled")
             self._notify("sound", tone)
@@ -469,68 +456,65 @@ class ClickEngine:
         with self._lock:
             self._enabled = False
             self._physically_held = False
-            self._suppress_current_press = False
             self._press_token += 1
             self._cancel.set()
-        self._release_owned_tap()
+
+    def set_screen_blocked(self, blocked: bool, reason: str = "") -> None:
+        restart_args = None
+        with self._lock:
+            blocked = bool(blocked)
+            if self._screen_blocked == blocked and self._screen_block_reason == reason:
+                return
+            self._screen_blocked = blocked
+            self._screen_block_reason = reason if blocked else ""
+            self._press_token += 1
+            self._cancel.set()
+
+            if not blocked and self._enabled and self._physically_held:
+                self._cancel = threading.Event()
+                token = self._press_token
+                config = self._config
+                target_window = (
+                    user32.GetForegroundWindow()
+                    if config.injection_mode == "message"
+                    else 0
+                )
+                restart_args = (
+                    token,
+                    config,
+                    target_window,
+                    self._cancel,
+                    time.perf_counter(),
+                )
+
+            if not self._enabled:
+                state = "paused"
+            elif blocked:
+                state = "guarded"
+            else:
+                state = "waiting"
+
+        if restart_args is not None:
+            self._worker = threading.Thread(
+                target=self._run_press, args=restart_args, daemon=True
+            )
+            self._worker.start()
+        self._notify(state, reason)
 
     def _still_active(self, token: int) -> bool:
         with self._lock:
-            return self._enabled and self._physically_held and token == self._press_token
+            return (
+                self._enabled
+                and not self._screen_blocked
+                and self._physically_held
+                and token == self._press_token
+            )
 
     def _record_generated_click(self) -> None:
         with self._lock:
             self._generated_clicks += 1
             stats = (self._physical_presses, self._generated_clicks)
         self._notify("stats", *stats)
-
-    def _start_owned_tap(
-        self, token: int, config: AppConfig, target_window: int
-    ) -> bool:
-        with self._lock:
-            if self._tap_owner_event is not None:
-                old_button, old_mode, old_window = self._tap_owner_event
-                send_button_event(old_button, False, old_mode, old_window)
-                self._tap_owner_token = None
-                self._tap_owner_event = None
-            sent = send_button_event(
-                config.trigger_button, True, config.injection_mode, target_window
-            )
-            if sent:
-                self._tap_owner_token = token
-                self._tap_owner_event = (
-                    config.trigger_button,
-                    config.injection_mode,
-                    target_window,
-                )
-            return sent
-
-    def _release_owned_tap(self, token: int | None = None) -> bool:
-        with self._lock:
-            if self._tap_owner_event is None:
-                return False
-            if token is not None and self._tap_owner_token != token:
-                return False
-            button, mode, target_window = self._tap_owner_event
-            self._tap_owner_token = None
-            self._tap_owner_event = None
-            return send_button_event(button, False, mode, target_window)
-
-    def _wait_click_hold(
-        self,
-        cancel_event: threading.Event,
-        hold_time: float,
-        finish_on_physical_release: bool,
-    ) -> bool:
-        started = time.perf_counter()
-        cancelled = cancel_event.wait(hold_time)
-        if cancelled and finish_on_physical_release:
-            with self._lock:
-                released_normally = self._enabled and not self._physically_held
-            remaining = hold_time - (time.perf_counter() - started)
-            if released_normally and remaining > 0:
-                time.sleep(remaining)
-        return cancelled
 
     def _run_press(
         self,
@@ -542,10 +526,8 @@ class ClickEngine:
     ) -> None:
         if initial_config.activation_mode == "stable":
             confirmation_delay = initial_config.hold_threshold_ms / 1000.0
-        elif initial_config.activation_mode == "progressive":
+        else:  # progressive
             confirmation_delay = 0.050
-        else:  # rapid
-            confirmation_delay = 0.030
 
         if cancel_event.wait(confirmation_delay) or not self._still_active(token):
             return
@@ -561,8 +543,7 @@ class ClickEngine:
             if cancel_event.wait(remaining) or not self._still_active(token):
                 return
         else:
-            transition_gap = 0.018 if initial_config.activation_mode == "stable" else 0.005
-            if cancel_event.wait(transition_gap) or not self._still_active(token):
+            if cancel_event.wait(0.005) or not self._still_active(token):
                 return
         self._notify("clicking")
 
@@ -591,50 +572,6 @@ class ClickEngine:
             remaining = max(0.0, interval - (time.perf_counter() - started))
             if cancel_event.wait(remaining):
                 break
-
-    def _run_tap_press(
-        self,
-        token: int,
-        initial_config: AppConfig,
-        target_window: int,
-        cancel_event: threading.Event,
-        first_started: float,
-    ) -> None:
-        interval = self._rhythm.next_interval(
-            initial_config.clicks_per_minute,
-            initial_config.jitter_percent,
-            initial_config.natural_rhythm,
-        )
-        hold_time = self._rhythm.fast_tap_hold_time(interval, initial_config.natural_rhythm)
-        cancelled = self._wait_click_hold(cancel_event, hold_time, finish_on_physical_release=True)
-        self._release_owned_tap(token)
-        if cancelled or not self._still_active(token):
-            return
-
-        remaining = max(0.0, interval - (time.perf_counter() - first_started))
-        if cancel_event.wait(remaining):
-            return
-
-        while self._still_active(token):
-            started = time.perf_counter()
-            config = self.config
-            interval = self._rhythm.next_interval(
-                config.clicks_per_minute, config.jitter_percent, config.natural_rhythm
-            )
-            sent = self._start_owned_tap(token, initial_config, target_window)
-            if sent:
-                self._record_generated_click()
-            hold_time = self._rhythm.fast_tap_hold_time(interval, config.natural_rhythm)
-            cancelled = self._wait_click_hold(
-                cancel_event, hold_time, finish_on_physical_release=True
-            )
-            self._release_owned_tap(token)
-            if cancelled or not self._still_active(token):
-                break
-            remaining = max(0.0, interval - (time.perf_counter() - started))
-            if cancel_event.wait(remaining):
-                break
-
 
 class GlobalInputMonitor:
     def __init__(self, engine: ClickEngine, notify) -> None:
@@ -753,6 +690,7 @@ class App:
         self.sound_player = SoundPlayer()
         self.engine = ClickEngine(self.config, self.post_event)
         self.monitor = GlobalInputMonitor(self.engine, self.post_event)
+        self.screen_detector: ScreenStateDetector | None = None
         self._status = "waiting" if self.config.start_enabled else "paused"
 
         self._build_window()
@@ -761,6 +699,8 @@ class App:
         self.root.after(50, self._drain_events)
         if not self.monitor.start():
             self._set_status("error", "全局鼠标监听启动失败。")
+        if self.config.screen_guard_enabled:
+            self.root.after(100, self._start_screen_detector)
 
     def _build_window(self) -> None:
         self.root.title(f"{APP_NAME}  {APP_VERSION}")
@@ -813,7 +753,7 @@ class App:
         ttk.Label(outer, text="自然长按连点器", style="Title.TLabel").pack(anchor="w")
         ttk.Label(
             outer,
-            text="四种触发策略，将鼠标按住转换为带自然波动的连续点击。",
+            text="两种触发策略，将鼠标按住转换为带自然波动的连续点击。",
             style="Subtitle.TLabel",
         ).pack(anchor="w", pady=(3, 16))
 
@@ -840,6 +780,7 @@ class App:
         self.hotkey_var = tk.StringVar(value=self.config.toggle_hotkey)
         self.natural_var = tk.BooleanVar(value=self.config.natural_rhythm)
         self.sound_var = tk.BooleanVar(value=self.config.sound_enabled)
+        self.screen_guard_var = tk.BooleanVar(value=self.config.screen_guard_enabled)
         self.start_var = tk.BooleanVar(value=self.config.start_enabled)
 
         self._setting_row(settings, 0, "点击频率", "每分钟 30–3000 次", self._spin(settings, self.cpm_var, 30, 3000, 10), "次/min")
@@ -848,8 +789,8 @@ class App:
             settings,
             2,
             "长按阈值",
-            "仅稳定长按使用；60–149ms 更快但更易误触",
-            self._spin(settings, self.threshold_var, 60, 1500, 10),
+            "仅稳定长按使用；最低 30ms，低于下限会自动修正",
+            self._spin(settings, self.threshold_var, 30, 1500, 10),
             "ms",
         )
 
@@ -860,10 +801,10 @@ class App:
             state="readonly",
             width=20,
         )
-        self._setting_row(settings, 3, "触发策略", "渐进由慢到快；即时点按接管所有点击", activation_box, "")
+        self._setting_row(settings, 3, "触发策略", "稳定按阈值触发；渐进由慢到快", activation_box, "")
 
         button_box = ttk.Combobox(settings, textvariable=self.button_var, values=list(BUTTON_LABELS.values()), state="readonly", width=13)
-        self._setting_row(settings, 4, "触发按键", "即时点按启用时，所有该按键操作都会被转换", button_box, "")
+        self._setting_row(settings, 4, "触发按键", "普通点按保持原样，按住后才开始连点", button_box, "")
 
         injection_box = ttk.Combobox(
             settings,
@@ -881,6 +822,11 @@ class App:
         options.grid(row=7, column=0, columnspan=4, sticky="ew", pady=(14, 0))
         ttk.Checkbutton(options, text="自然节奏（轻微漂移和低概率短停顿）", variable=self.natural_var).pack(anchor="w")
         ttk.Checkbutton(options, text="状态提示音（开启升调、暂停降调）", variable=self.sound_var).pack(anchor="w", pady=(5, 0))
+        ttk.Checkbutton(
+            options,
+            text="识别背包时钟 / 技能鼠标图标时静默暂停连点（40 Hz）",
+            variable=self.screen_guard_var,
+        ).pack(anchor="w", pady=(5, 0))
         ttk.Checkbutton(options, text="下次启动时自动启用", variable=self.start_var).pack(anchor="w", pady=(5, 0))
 
         footer = ttk.Frame(outer)
@@ -897,6 +843,13 @@ class App:
             style="Subtitle.TLabel",
         )
         self.stats_label.pack(anchor="w", pady=(13, 0))
+
+        self.guard_label = ttk.Label(
+            outer,
+            text="界面检测：未启用",
+            style="Subtitle.TLabel",
+        )
+        self.guard_label.pack(anchor="w", pady=(5, 0))
 
         safety = ttk.Label(
             outer,
@@ -932,7 +885,7 @@ class App:
         try:
             while True:
                 name, args = self.events.get_nowait()
-                if name in {"waiting", "paused", "clicking"}:
+                if name in {"waiting", "paused", "clicking", "guarded"}:
                     self._set_status(name, *(args[:1]))
                 elif name == "stats":
                     self.stats_label.configure(
@@ -942,6 +895,22 @@ class App:
                     self.sound_player.play(args[0])
                 elif name == "error":
                     self._set_status("error", args[0] if args else "发生未知错误。")
+                elif name == "guard_status":
+                    self.guard_label.configure(text=f"界面检测：{args[0]}")
+                elif name == "guard_state":
+                    blocked, reason, mouse_score, clock_score = args
+                    if blocked:
+                        text = f"已静默暂停 · {reason}"
+                    else:
+                        text = "监控中 · 未发现阻断图标"
+                    self.guard_label.configure(
+                        text=(
+                            f"界面检测：{text}"
+                            f"（鼠标 {mouse_score:.3f} / 时钟 {clock_score:.3f}）"
+                        )
+                    )
+                elif name == "guard_error":
+                    self.guard_label.configure(text=f"界面检测：已停止 · {args[0]}")
         except queue.Empty:
             pass
         self.root.after(50, self._drain_events)
@@ -952,11 +921,15 @@ class App:
         states = {
             "waiting": ("●  已启用", f"等待长按 · {hotkey} 暂停", "暂停"),
             "clicking": ("●  正在连续点击", "松开鼠标立即停止 · F12 紧急停止", "暂停"),
+            "guarded": ("●  自动连点已临时抑制", detail or "检测到无需连点的界面状态", "暂停"),
             "paused": ("●  已暂停", f"普通鼠标操作不受影响 · {hotkey} 继续", "继续"),
             "error": ("●  需要处理", detail or "监听启动失败", "重试"),
         }
         title, default_detail, button = states[status]
-        self.status_title.configure(text=title, foreground=self.GREEN if status in {"waiting", "clicking"} else self.RED)
+        self.status_title.configure(
+            text=title,
+            foreground=self.GREEN if status in {"waiting", "clicking"} else self.RED,
+        )
         self.status_detail.configure(text=detail or default_detail)
         self.toggle_button.configure(text=button)
 
@@ -979,16 +952,16 @@ class App:
                 toggle_hotkey=self.hotkey_var.get(),
                 natural_rhythm=self.natural_var.get(),
                 sound_enabled=self.sound_var.get(),
+                screen_guard_enabled=self.screen_guard_var.get(),
                 start_enabled=self.start_var.get(),
             )
             validated = new_config.validated()
-            if validated != new_config:
-                raise ValueError("数值超出允许范围")
         except (ValueError, KeyError):
-            messagebox.showerror("设置无效", "请检查频率、波动和长按阈值是否在允许范围内。")
+            messagebox.showerror("设置无效", "频率、波动和长按阈值必须是有效数字。")
             return
 
         old_hotkey = self.config.toggle_hotkey
+        old_screen_guard = self.config.screen_guard_enabled
         self.config = validated
         self.engine.update_config(validated)
         try:
@@ -998,9 +971,53 @@ class App:
             return
         if old_hotkey != validated.toggle_hotkey:
             self.monitor.change_hotkey(validated.toggle_hotkey)
+        self.cpm_var.set(str(validated.clicks_per_minute))
+        self.jitter_var.set(f"{validated.jitter_percent:g}")
+        self.threshold_var.set(str(validated.hold_threshold_ms))
+        if old_screen_guard != validated.screen_guard_enabled:
+            if validated.screen_guard_enabled:
+                self._start_screen_detector()
+            else:
+                self._stop_screen_detector()
         self.feedback.configure(text="设置已保存并立即生效")
         self.root.after(2500, lambda: self.feedback.configure(text=""))
-        self._set_status("waiting" if self.engine.enabled else "paused")
+        blocked, reason = self.engine.screen_block
+        self._set_status(
+            "guarded" if self.engine.enabled and blocked else (
+                "waiting" if self.engine.enabled else "paused"
+            ),
+            reason or None,
+        )
+
+    def _start_screen_detector(self) -> None:
+        if self.screen_detector is not None:
+            return
+        self.guard_label.configure(text="界面检测：正在启动…")
+        self.screen_detector = ScreenStateDetector(
+            bundled_path("assets"),
+            self._on_guard_state,
+            lambda text: self.post_event("guard_status", text),
+            self._on_guard_error,
+        )
+        self.screen_detector.start()
+
+    def _stop_screen_detector(self) -> None:
+        detector = self.screen_detector
+        self.screen_detector = None
+        if detector is not None:
+            detector.stop()
+        self.engine.set_screen_blocked(False)
+        self.guard_label.configure(text="界面检测：未启用")
+
+    def _on_guard_state(
+        self, blocked: bool, reason: str, mouse_score: float, clock_score: float
+    ) -> None:
+        self.engine.set_screen_blocked(blocked, reason)
+        self.post_event("guard_state", blocked, reason, mouse_score, clock_score)
+
+    def _on_guard_error(self, text: str) -> None:
+        self.engine.set_screen_blocked(False)
+        self.post_event("guard_error", text)
 
     def restart_as_admin(self) -> None:
         if getattr(sys, "frozen", False):
@@ -1022,6 +1039,9 @@ class App:
             messagebox.showerror("无法提升权限", "管理员启动被取消或被系统阻止。")
 
     def close(self) -> None:
+        if self.screen_detector is not None:
+            self.screen_detector.stop()
+            self.screen_detector = None
         self.engine.shutdown()
         self.monitor.stop()
         self.sound_player.close()
@@ -1033,6 +1053,7 @@ class App:
 def main() -> None:
     if os.name != "nt":
         raise SystemExit("This application only supports Windows.")
+    make_dpi_aware()
     instance_guard = SingleInstanceGuard()
     if instance_guard.already_running:
         ctypes.windll.user32.MessageBoxW(

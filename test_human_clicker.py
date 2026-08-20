@@ -1,4 +1,6 @@
 import random
+import threading
+import time
 import unittest
 import uuid
 from unittest.mock import patch
@@ -11,13 +13,13 @@ class ConfigTests(unittest.TestCase):
         config = AppConfig(
             clicks_per_minute=99999,
             jitter_percent=-2,
-            hold_threshold_ms=10,
+            hold_threshold_ms=0,
             activation_mode="unknown",
             injection_mode="unknown",
         ).validated()
         self.assertEqual(config.clicks_per_minute, 3000)
         self.assertEqual(config.jitter_percent, 0)
-        self.assertEqual(config.hold_threshold_ms, 60)
+        self.assertEqual(config.hold_threshold_ms, 30)
         self.assertEqual(config.activation_mode, "stable")
         self.assertEqual(config.injection_mode, "sendinput")
 
@@ -38,51 +40,14 @@ class HumanRhythmTests(unittest.TestCase):
         values = [rhythm.next_interval(3000, 50, True) for _ in range(5000)]
         self.assertTrue(all(value >= 0.008 for value in values))
 
-    def test_fast_tap_duration_is_short_and_positive(self):
-        rhythm = HumanRhythm(random.Random(11))
-        values = [rhythm.fast_tap_hold_time(0.1, True) for _ in range(1000)]
-        self.assertTrue(all(0.014 <= value <= 0.040 for value in values))
-
-
 class ActivationModeTests(unittest.TestCase):
-    def test_tap_all_suppresses_physical_pair_and_generates_one_tap(self):
-        events = []
-        engine = ClickEngine(
-            AppConfig(
-                activation_mode="tap_all",
-                injection_mode="sendinput",
-                clicks_per_minute=600,
-                jitter_percent=0,
-                natural_rhythm=False,
-                start_enabled=True,
-            ),
-            lambda *args: events.append(args),
-        )
-        with patch("human_clicker.send_button_event", return_value=True) as sender:
-            self.assertTrue(engine.physical_down("left"))
-            self.assertTrue(engine.physical_up("left"))
-            engine._worker.join(timeout=0.5)
-            self.assertFalse(engine._worker.is_alive())
-        self.assertGreaterEqual(sender.call_count, 2)
-        generated = [event for event in events if event[0] == "stats" and event[2] == 1]
-        self.assertTrue(generated)
-
-    def test_tap_all_passes_input_through_while_paused(self):
-        engine = ClickEngine(
-            AppConfig(activation_mode="tap_all", start_enabled=False), lambda *args: None
-        )
-        with patch("human_clicker.send_button_event") as sender:
-            self.assertFalse(engine.physical_down("left"))
-            self.assertFalse(engine.physical_up("left"))
-        sender.assert_not_called()
-
-    def test_non_replacement_modes_never_suppress_native_click(self):
-        for mode in ("stable", "progressive", "rapid"):
+    def test_available_modes_never_suppress_native_click(self):
+        for mode in ("stable", "progressive"):
             with self.subTest(mode=mode):
                 engine = ClickEngine(
                     AppConfig(
                         activation_mode=mode,
-                        hold_threshold_ms=60,
+                        hold_threshold_ms=30,
                         start_enabled=True,
                     ),
                     lambda *args: None,
@@ -90,6 +55,71 @@ class ActivationModeTests(unittest.TestCase):
                 self.assertFalse(engine.physical_down("left"))
                 self.assertFalse(engine.physical_up("left"))
                 engine._worker.join(timeout=0.5)
+
+    def test_minimum_stable_threshold_starts_clicking(self):
+        clicked = threading.Event()
+        engine = ClickEngine(
+            AppConfig(
+                activation_mode="stable",
+                hold_threshold_ms=30,
+                clicks_per_minute=600,
+                jitter_percent=0,
+                natural_rhythm=False,
+            ),
+            lambda *args: None,
+        )
+
+        def send(*_args):
+            clicked.set()
+            return True
+
+        with patch("human_clicker.send_button_event", side_effect=send):
+            engine.physical_down("left")
+            self.assertTrue(clicked.wait(0.15))
+            engine.physical_up("left")
+            engine._worker.join(timeout=0.5)
+
+
+class ScreenGuardTests(unittest.TestCase):
+    def test_blocking_is_silent_and_does_not_swallow_physical_input(self):
+        events = []
+        engine = ClickEngine(
+            AppConfig(sound_enabled=True, start_enabled=True),
+            lambda *args: events.append(args),
+        )
+        engine.set_screen_blocked(True, "背包时钟")
+        with patch("human_clicker.send_button_event") as sender:
+            self.assertFalse(engine.physical_down("left"))
+            time.sleep(0.05)
+            self.assertFalse(engine.physical_up("left"))
+        sender.assert_not_called()
+        engine.set_screen_blocked(False)
+        self.assertFalse(any(event[0] == "sound" for event in events))
+
+    def test_clearing_guard_restarts_held_press(self):
+        clicked = threading.Event()
+        engine = ClickEngine(
+            AppConfig(
+                hold_threshold_ms=30,
+                clicks_per_minute=600,
+                jitter_percent=0,
+                natural_rhythm=False,
+                start_enabled=True,
+            ),
+            lambda *args: None,
+        )
+        engine.set_screen_blocked(True, "技能鼠标图标")
+        engine.physical_down("left")
+
+        def send(*_args):
+            clicked.set()
+            return True
+
+        with patch("human_clicker.send_button_event", side_effect=send):
+            engine.set_screen_blocked(False)
+            self.assertTrue(clicked.wait(0.15))
+            engine.physical_up("left")
+            engine._worker.join(timeout=0.5)
 
 
 class SoundNotificationTests(unittest.TestCase):

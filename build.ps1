@@ -14,13 +14,17 @@ if (-not (Test-Path -LiteralPath $PythonExe)) {
         }
         & python -m venv (Join-Path $ProjectDir ".venv")
     }
-    & $PythonExe -m pip install --disable-pip-version-check -r (Join-Path $ProjectDir "requirements-build.txt")
 }
+
+& $PythonExe -m pip install --disable-pip-version-check -r (Join-Path $ProjectDir "requirements-build.txt")
 
 Push-Location $ProjectDir
 try {
     & $PythonExe -m PyInstaller --noconfirm --clean --onefile --windowed `
         --name "自然长按连点器" `
+        --add-data "$ProjectDir\assets;assets" `
+        --hidden-import dxcam `
+        --hidden-import mss `
         "$ProjectDir\human_clicker.py"
     Write-Host "已生成: $ProjectDir\dist\自然长按连点器.exe"
 }
