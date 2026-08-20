@@ -5,7 +5,16 @@ import unittest
 import uuid
 from unittest.mock import patch
 
-from human_clicker import AppConfig, ClickEngine, HumanRhythm, SingleInstanceGuard
+from human_clicker import (
+    AppConfig,
+    ClickEngine,
+    GlobalInputMonitor,
+    HumanRhythm,
+    SingleInstanceGuard,
+    binding_conflict_message,
+    input_code_label,
+    normalized_pause_bindings,
+)
 
 
 class ConfigTests(unittest.TestCase):
@@ -22,6 +31,33 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.hold_threshold_ms, 30)
         self.assertEqual(config.activation_mode, "stable")
         self.assertEqual(config.injection_mode, "sendinput")
+
+    def test_pause_bindings_are_deduplicated_and_clamped(self):
+        bindings = normalized_pause_bindings(
+            [
+                ["k:81", 0, True],
+                ["M:X1", 99999, True],
+                ["K:81", 320, False],
+                ["bad", 200, True],
+            ]
+        )
+        self.assertEqual(bindings, (("K:81", 320, False), ("M:X1", 10000, True)))
+        self.assertEqual(input_code_label("K:81"), "Q")
+        self.assertEqual(input_code_label("M:X1"), "鼠标侧键 1")
+
+    def test_reserved_and_trigger_keys_report_conflicts(self):
+        self.assertIn(
+            "暂停/继续",
+            binding_conflict_message(
+                AppConfig(toggle_hotkey="F8", pause_bindings=(("K:119", 200, True),))
+            ),
+        )
+        self.assertIn(
+            "连点触发键",
+            binding_conflict_message(
+                AppConfig(trigger_button="left", pause_bindings=(("M:LEFT", 200, True),))
+            ),
+        )
 
 
 class HumanRhythmTests(unittest.TestCase):
@@ -120,6 +156,74 @@ class ScreenGuardTests(unittest.TestCase):
             self.assertTrue(clicked.wait(0.15))
             engine.physical_up("left")
             engine._worker.join(timeout=0.5)
+
+
+class KeyPauseTests(unittest.TestCase):
+    def test_key_pause_is_silent_and_clears_automatically(self):
+        events = []
+        engine = ClickEngine(
+            AppConfig(sound_enabled=True, start_enabled=True),
+            lambda *args: events.append(args),
+        )
+        engine.trigger_key_pause("K:81", "Q", 40)
+        blocked, reason = engine.auto_block
+        self.assertTrue(blocked)
+        self.assertIn("Q", reason)
+        time.sleep(0.09)
+        self.assertEqual(engine.auto_block, (False, ""))
+        self.assertFalse(any(event[0] == "sound" for event in events))
+        engine.shutdown()
+
+    def test_visual_guard_keeps_clicker_blocked_after_key_timer_ends(self):
+        engine = ClickEngine(AppConfig(start_enabled=True), lambda *args: None)
+        engine.set_screen_blocked(True, "技能鼠标图标")
+        engine.trigger_key_pause("K:69", "E", 30)
+        time.sleep(0.07)
+        blocked, reason = engine.auto_block
+        self.assertTrue(blocked)
+        self.assertIn("技能鼠标图标", reason)
+        self.assertNotIn("按键预暂停", reason)
+        engine.set_screen_blocked(False)
+        self.assertEqual(engine.auto_block, (False, ""))
+        engine.shutdown()
+
+    def test_overlapping_key_windows_clear_independently(self):
+        engine = ClickEngine(AppConfig(start_enabled=True), lambda *args: None)
+        engine.trigger_key_pause("K:81", "Q", 35)
+        time.sleep(0.015)
+        engine.trigger_key_pause("K:69", "E", 80)
+        time.sleep(0.045)
+        blocked, reason = engine.auto_block
+        self.assertTrue(blocked)
+        self.assertNotIn("Q", reason)
+        self.assertIn("E", reason)
+        time.sleep(0.06)
+        self.assertEqual(engine.auto_block, (False, ""))
+        engine.shutdown()
+
+    def test_monitor_ignores_key_repeat_until_release(self):
+        engine = ClickEngine(
+            AppConfig(pause_bindings=(("K:81", 200, True),)),
+            lambda *args: None,
+        )
+        monitor = GlobalInputMonitor(engine, lambda *args: None)
+        with patch.object(engine, "trigger_key_pause") as trigger:
+            monitor._handle_input_event("K:81", "Q", True)
+            monitor._handle_input_event("K:81", "Q", True)
+            monitor._handle_input_event("K:81", "Q", False)
+            monitor._handle_input_event("K:81", "Q", True)
+        self.assertEqual(trigger.call_count, 2)
+        engine.shutdown()
+
+    def test_binding_capture_swallows_down_and_matching_up(self):
+        events = []
+        engine = ClickEngine(AppConfig(), lambda *args: None)
+        monitor = GlobalInputMonitor(engine, lambda *args: events.append(args))
+        monitor.begin_binding_capture()
+        self.assertTrue(monitor._handle_input_event("M:X2", "鼠标侧键 2", True))
+        self.assertTrue(monitor._handle_input_event("M:X2", "鼠标侧键 2", False))
+        self.assertEqual(events, [("binding_captured", "M:X2", "鼠标侧键 2")])
+        engine.shutdown()
 
 
 class SoundNotificationTests(unittest.TestCase):

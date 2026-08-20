@@ -7,3 +7,4 @@ dist/
 .idea/
 .vscode/
 *.log
+.smoke_localapp/

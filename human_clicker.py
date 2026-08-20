@@ -6,6 +6,7 @@ import math
 import os
 import queue
 import random
+import re
 import sys
 import threading
 import time
@@ -20,7 +21,7 @@ from screen_state_detector import ScreenStateDetector, make_dpi_aware
 
 
 APP_NAME = "自然长按连点器"
-APP_VERSION = "1.4.0"
+APP_VERSION = "1.5.0"
 INJECTED_MARKER = 0xC0DEC11C
 SINGLE_INSTANCE_MUTEX = "Local\\NaturalHoldClicker.SingleInstance"
 ERROR_ALREADY_EXISTS = 183
@@ -31,10 +32,18 @@ WM_RBUTTONDOWN = 0x0204
 WM_RBUTTONUP = 0x0205
 WM_MBUTTONDOWN = 0x0207
 WM_MBUTTONUP = 0x0208
+WM_XBUTTONDOWN = 0x020B
+WM_XBUTTONUP = 0x020C
+WM_KEYDOWN = 0x0100
+WM_KEYUP = 0x0101
+WM_SYSKEYDOWN = 0x0104
+WM_SYSKEYUP = 0x0105
 WM_HOTKEY = 0x0312
 WM_QUIT = 0x0012
+WH_KEYBOARD_LL = 13
 WH_MOUSE_LL = 14
 LLMHF_INJECTED = 0x00000001
+LLKHF_INJECTED = 0x00000010
 
 MOUSEEVENTF_LEFTDOWN = 0x0002
 MOUSEEVENTF_LEFTUP = 0x0004
@@ -63,6 +72,106 @@ INJECTION_LABELS = {
 }
 LABEL_TO_INJECTION = {label: key for key, label in INJECTION_LABELS.items()}
 HOTKEYS = {f"F{i}": 0x6F + i for i in range(6, 12)}
+MAX_PAUSE_BINDINGS = 12
+PAUSE_MIN_MS = 10
+PAUSE_MAX_MS = 10000
+PAUSE_CODE_PATTERN = re.compile(r"^(?:K:\d{1,3}|M:(?:LEFT|RIGHT|MIDDLE|X1|X2))$")
+
+VK_LABELS = {
+    0x08: "Backspace",
+    0x09: "Tab",
+    0x0D: "Enter",
+    0x10: "Shift",
+    0x11: "Ctrl",
+    0x12: "Alt",
+    0x13: "Pause",
+    0x14: "Caps Lock",
+    0x1B: "Esc",
+    0x20: "Space",
+    0x21: "Page Up",
+    0x22: "Page Down",
+    0x23: "End",
+    0x24: "Home",
+    0x25: "←",
+    0x26: "↑",
+    0x27: "→",
+    0x28: "↓",
+    0x2D: "Insert",
+    0x2E: "Delete",
+    0x5B: "左 Win",
+    0x5C: "右 Win",
+    0x60: "小键盘 0",
+    0x61: "小键盘 1",
+    0x62: "小键盘 2",
+    0x63: "小键盘 3",
+    0x64: "小键盘 4",
+    0x65: "小键盘 5",
+    0x66: "小键盘 6",
+    0x67: "小键盘 7",
+    0x68: "小键盘 8",
+    0x69: "小键盘 9",
+    0x6A: "小键盘 *",
+    0x6B: "小键盘 +",
+    0x6D: "小键盘 -",
+    0x6E: "小键盘 .",
+    0x6F: "小键盘 /",
+    0xA0: "左 Shift",
+    0xA1: "右 Shift",
+    0xA2: "左 Ctrl",
+    0xA3: "右 Ctrl",
+    0xA4: "左 Alt",
+    0xA5: "右 Alt",
+}
+MOUSE_PAUSE_LABELS = {
+    "M:LEFT": "鼠标左键",
+    "M:RIGHT": "鼠标右键",
+    "M:MIDDLE": "鼠标中键",
+    "M:X1": "鼠标侧键 1",
+    "M:X2": "鼠标侧键 2",
+}
+
+
+def keyboard_code(vk_code: int) -> str:
+    return f"K:{int(vk_code)}"
+
+
+def input_code_label(code: str) -> str:
+    if code in MOUSE_PAUSE_LABELS:
+        return MOUSE_PAUSE_LABELS[code]
+    if not code.startswith("K:"):
+        return code
+    try:
+        vk_code = int(code[2:])
+    except ValueError:
+        return code
+    if 0x30 <= vk_code <= 0x39 or 0x41 <= vk_code <= 0x5A:
+        return chr(vk_code)
+    if 0x70 <= vk_code <= 0x87:
+        return f"F{vk_code - 0x6F}"
+    return VK_LABELS.get(vk_code, f"按键 VK {vk_code}")
+
+
+def normalized_pause_bindings(raw_bindings) -> tuple[tuple[str, int, bool], ...]:
+    result: list[tuple[str, int, bool]] = []
+    positions: dict[str, int] = {}
+    for item in raw_bindings or ():
+        if not isinstance(item, (list, tuple)) or len(item) not in {2, 3}:
+            continue
+        code = str(item[0]).upper()
+        if not PAUSE_CODE_PATTERN.fullmatch(code):
+            continue
+        try:
+            duration = max(PAUSE_MIN_MS, min(PAUSE_MAX_MS, int(item[1])))
+        except (TypeError, ValueError):
+            continue
+        enabled = bool(item[2]) if len(item) == 3 else True
+        entry = (code, duration, enabled)
+        if code in positions:
+            result[positions[code]] = entry
+        elif len(result) < MAX_PAUSE_BINDINGS:
+            positions[code] = len(result)
+            result.append(entry)
+    return tuple(result)
 
 
 @dataclass(frozen=True)
@@ -77,6 +186,7 @@ class AppConfig:
     natural_rhythm: bool = True
     sound_enabled: bool = True
     screen_guard_enabled: bool = False
+    pause_bindings: tuple[tuple[str, int, bool], ...] = ()
     start_enabled: bool = True
 
     def validated(self) -> "AppConfig":
@@ -92,8 +202,24 @@ class AppConfig:
             natural_rhythm=bool(self.natural_rhythm),
             sound_enabled=bool(self.sound_enabled),
             screen_guard_enabled=bool(self.screen_guard_enabled),
+            pause_bindings=normalized_pause_bindings(self.pause_bindings),
             start_enabled=bool(self.start_enabled),
         )
+
+
+def binding_conflict_message(config: AppConfig) -> str | None:
+    toggle_code = keyboard_code(HOTKEYS.get(config.toggle_hotkey, HOTKEYS["F8"]))
+    trigger_code = f"M:{config.trigger_button.upper()}"
+    for code, _duration, enabled in normalized_pause_bindings(config.pause_bindings):
+        if not enabled:
+            continue
+        if code == keyboard_code(VK_F12):
+            return "F12 是紧急停止键，不能同时用作按键暂停规则。"
+        if code == toggle_code:
+            return f"{config.toggle_hotkey} 是暂停/继续快捷键，不能同时用作按键暂停规则。"
+        if code == trigger_code:
+            return f"{input_code_label(code)} 是当前连点触发键，不能同时用作按键暂停规则。"
+    return None
 
 
 def config_path() -> Path:
@@ -229,10 +355,20 @@ class MSLLHOOKSTRUCT(ctypes.Structure):
     ]
 
 
+class KBDLLHOOKSTRUCT(ctypes.Structure):
+    _fields_ = [
+        ("vkCode", wintypes.DWORD),
+        ("scanCode", wintypes.DWORD),
+        ("flags", wintypes.DWORD),
+        ("time", wintypes.DWORD),
+        ("dwExtraInfo", ULONG_PTR),
+    ]
+
+
 if os.name == "nt":
     user32 = ctypes.WinDLL("user32", use_last_error=True)
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    LOW_LEVEL_MOUSE_PROC = ctypes.WINFUNCTYPE(
+    LOW_LEVEL_HOOK_PROC = ctypes.WINFUNCTYPE(
         ctypes.c_ssize_t, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM
     )
 
@@ -255,7 +391,7 @@ if os.name == "nt":
     user32.ScreenToClient.restype = wintypes.BOOL
     user32.SetWindowsHookExW.argtypes = (
         ctypes.c_int,
-        LOW_LEVEL_MOUSE_PROC,
+        LOW_LEVEL_HOOK_PROC,
         wintypes.HINSTANCE,
         wintypes.DWORD,
     )
@@ -363,6 +499,8 @@ class ClickEngine:
         self._generated_clicks = 0
         self._screen_blocked = False
         self._screen_block_reason = ""
+        self._key_pauses: dict[str, tuple[float, str]] = {}
+        self._key_pause_timer: threading.Timer | None = None
 
     @property
     def enabled(self) -> bool:
@@ -375,22 +513,26 @@ class ClickEngine:
             return self._config
 
     @property
-    def screen_block(self) -> tuple[bool, str]:
+    def auto_block(self) -> tuple[bool, str]:
         with self._lock:
-            return self._screen_blocked, self._screen_block_reason
+            return self._block_snapshot_locked()
 
     def update_config(self, config: AppConfig) -> None:
+        pause_bindings_changed = False
         with self._lock:
             input_changed = (
                 config.trigger_button != self._config.trigger_button
                 or config.activation_mode != self._config.activation_mode
                 or config.injection_mode != self._config.injection_mode
             )
+            pause_bindings_changed = config.pause_bindings != self._config.pause_bindings
             self._config = config
             if input_changed:
                 self._press_token += 1
                 self._physically_held = False
                 self._cancel.set()
+        if pause_bindings_changed:
+            self.clear_key_pauses()
 
     def physical_down(self, button: str) -> bool:
         with self._lock:
@@ -402,7 +544,8 @@ class ClickEngine:
             self._press_token += 1
             token = self._press_token
             self._cancel = threading.Event()
-            if not self._enabled or self._screen_blocked:
+            blocked, _reason = self._block_snapshot_locked()
+            if not self._enabled or blocked:
                 return False
             config = self._config
             cancel_event = self._cancel
@@ -424,10 +567,11 @@ class ClickEngine:
             self._physically_held = False
             self._press_token += 1
             self._cancel.set()
-            state = "guarded" if self._enabled and self._screen_blocked else (
+            blocked, reason = self._block_snapshot_locked()
+            state = "guarded" if self._enabled and blocked else (
                 "waiting" if self._enabled else "paused"
             )
-        self._notify(state)
+        self._notify(state, reason)
         return False
 
     def set_enabled(self, enabled: bool, source: str = "ui") -> None:
@@ -438,10 +582,11 @@ class ClickEngine:
             self._press_token += 1
             self._cancel.set()
             sound_enabled = self._config.sound_enabled
-            state = "guarded" if enabled and self._screen_blocked else (
+            blocked, reason = self._block_snapshot_locked()
+            state = "guarded" if enabled and blocked else (
                 "waiting" if enabled else "paused"
             )
-        self._notify(state, source)
+        self._notify(state, reason if state == "guarded" else source)
         if sound_enabled:
             tone = "enabled" if enabled else ("panic" if source == "panic" else "disabled")
             self._notify("sound", tone)
@@ -458,42 +603,48 @@ class ClickEngine:
             self._physically_held = False
             self._press_token += 1
             self._cancel.set()
+            self._key_pauses.clear()
+            if self._key_pause_timer is not None:
+                self._key_pause_timer.cancel()
+                self._key_pause_timer = None
 
-    def set_screen_blocked(self, blocked: bool, reason: str = "") -> None:
-        restart_args = None
-        with self._lock:
-            blocked = bool(blocked)
-            if self._screen_blocked == blocked and self._screen_block_reason == reason:
-                return
-            self._screen_blocked = blocked
-            self._screen_block_reason = reason if blocked else ""
-            self._press_token += 1
-            self._cancel.set()
+    def _prune_key_pauses_locked(self, now: float | None = None) -> None:
+        now = time.perf_counter() if now is None else now
+        expired = [code for code, (deadline, _label) in self._key_pauses.items() if deadline <= now]
+        for code in expired:
+            self._key_pauses.pop(code, None)
 
-            if not blocked and self._enabled and self._physically_held:
-                self._cancel = threading.Event()
-                token = self._press_token
-                config = self._config
-                target_window = (
-                    user32.GetForegroundWindow()
-                    if config.injection_mode == "message"
-                    else 0
-                )
-                restart_args = (
-                    token,
-                    config,
-                    target_window,
-                    self._cancel,
-                    time.perf_counter(),
-                )
+    def _block_snapshot_locked(
+        self, now: float | None = None, *, prune: bool = True
+    ) -> tuple[bool, str]:
+        if prune:
+            self._prune_key_pauses_locked(now)
+        reasons: list[str] = []
+        if self._screen_blocked:
+            reasons.append(self._screen_block_reason or "界面图标")
+        if self._key_pauses:
+            labels = sorted({label for _deadline, label in self._key_pauses.values()})
+            reasons.append(f"按键预暂停：{' / '.join(labels)}")
+        return bool(reasons), "；".join(reasons)
 
-            if not self._enabled:
-                state = "paused"
-            elif blocked:
-                state = "guarded"
-            else:
-                state = "waiting"
+    def _restart_held_locked(self):
+        if not self._enabled or not self._physically_held:
+            return None
+        self._cancel = threading.Event()
+        token = self._press_token
+        config = self._config
+        target_window = (
+            user32.GetForegroundWindow() if config.injection_mode == "message" else 0
+        )
+        return (
+            token,
+            config,
+            target_window,
+            self._cancel,
+            time.perf_counter(),
+        )
 
+    def _finish_block_change(self, restart_args, state: str, reason: str) -> None:
         if restart_args is not None:
             self._worker = threading.Thread(
                 target=self._run_press, args=restart_args, daemon=True
@@ -501,11 +652,118 @@ class ClickEngine:
             self._worker.start()
         self._notify(state, reason)
 
+    def _schedule_key_pause_timer_locked(self) -> None:
+        if self._key_pause_timer is not None:
+            self._key_pause_timer.cancel()
+            self._key_pause_timer = None
+        self._prune_key_pauses_locked()
+        if not self._key_pauses:
+            return
+        next_deadline = min(deadline for deadline, _label in self._key_pauses.values())
+        delay = max(0.001, next_deadline - time.perf_counter())
+        self._key_pause_timer = threading.Timer(delay, self._expire_key_pauses)
+        self._key_pause_timer.daemon = True
+        self._key_pause_timer.start()
+
+    def _expire_key_pauses(self) -> None:
+        restart_args = None
+        with self._lock:
+            before_blocked, before_reason = self._block_snapshot_locked(prune=False)
+            self._key_pause_timer = None
+            self._prune_key_pauses_locked()
+            self._schedule_key_pause_timer_locked()
+            blocked, reason = self._block_snapshot_locked()
+            if before_blocked and not blocked:
+                self._press_token += 1
+                self._cancel.set()
+                restart_args = self._restart_held_locked()
+            if not self._enabled:
+                state = "paused"
+            elif blocked:
+                state = "guarded"
+            else:
+                state = "waiting"
+            changed = (before_blocked, before_reason) != (blocked, reason)
+        if changed:
+            self._finish_block_change(restart_args, state, reason)
+
+    def trigger_key_pause(self, code: str, label: str, duration_ms: int) -> None:
+        restart_args = None
+        with self._lock:
+            before_blocked, before_reason = self._block_snapshot_locked()
+            duration_ms = max(PAUSE_MIN_MS, min(PAUSE_MAX_MS, int(duration_ms)))
+            self._key_pauses[code] = (
+                time.perf_counter() + duration_ms / 1000.0,
+                label,
+            )
+            self._schedule_key_pause_timer_locked()
+            blocked, reason = self._block_snapshot_locked()
+            if not before_blocked and blocked:
+                self._press_token += 1
+                self._cancel.set()
+            if not self._enabled:
+                state = "paused"
+            else:
+                state = "guarded"
+            changed = (before_blocked, before_reason) != (blocked, reason)
+        if changed:
+            self._finish_block_change(restart_args, state, reason)
+
+    def clear_key_pauses(self) -> None:
+        restart_args = None
+        with self._lock:
+            before_blocked, before_reason = self._block_snapshot_locked()
+            self._key_pauses.clear()
+            if self._key_pause_timer is not None:
+                self._key_pause_timer.cancel()
+                self._key_pause_timer = None
+            blocked, reason = self._block_snapshot_locked()
+            if before_blocked and not blocked:
+                self._press_token += 1
+                self._cancel.set()
+                restart_args = self._restart_held_locked()
+            if not self._enabled:
+                state = "paused"
+            elif blocked:
+                state = "guarded"
+            else:
+                state = "waiting"
+            changed = (before_blocked, before_reason) != (blocked, reason)
+        if changed:
+            self._finish_block_change(restart_args, state, reason)
+
+    def set_screen_blocked(self, blocked: bool, reason: str = "") -> None:
+        restart_args = None
+        with self._lock:
+            blocked = bool(blocked)
+            if self._screen_blocked == blocked and self._screen_block_reason == reason:
+                return
+            before_blocked, before_reason = self._block_snapshot_locked()
+            self._screen_blocked = blocked
+            self._screen_block_reason = reason if blocked else ""
+            current_blocked, current_reason = self._block_snapshot_locked()
+            if before_blocked != current_blocked:
+                self._press_token += 1
+                self._cancel.set()
+                if not current_blocked:
+                    restart_args = self._restart_held_locked()
+
+            if not self._enabled:
+                state = "paused"
+            elif current_blocked:
+                state = "guarded"
+            else:
+                state = "waiting"
+            changed = (before_blocked, before_reason) != (current_blocked, current_reason)
+        if changed:
+            self._finish_block_change(restart_args, state, current_reason)
+
     def _still_active(self, token: int) -> bool:
         with self._lock:
+            blocked, _reason = self._block_snapshot_locked()
             return (
                 self._enabled
-                and not self._screen_blocked
+                and not blocked
                 and self._physically_held
                 and token == self._press_token
             )
@@ -580,10 +838,16 @@ class GlobalInputMonitor:
         self._thread: threading.Thread | None = None
         self._thread_id = 0
         self._ready = threading.Event()
-        self._hook = None
-        self._callback = None
+        self._mouse_hook = None
+        self._keyboard_hook = None
+        self._mouse_callback = None
+        self._keyboard_callback = None
         self._hotkey_name = engine.config.toggle_hotkey
         self._running = False
+        self._input_lock = threading.Lock()
+        self._capture_next = False
+        self._pressed_inputs: set[str] = set()
+        self._suppressed_inputs: set[str] = set()
 
     def start(self) -> bool:
         if os.name != "nt":
@@ -593,7 +857,7 @@ class GlobalInputMonitor:
         self._thread = threading.Thread(target=self._message_loop, daemon=True)
         self._thread.start()
         self._ready.wait(2.0)
-        return bool(self._hook)
+        return bool(self._mouse_hook and self._keyboard_hook)
 
     def stop(self) -> None:
         self._running = False
@@ -608,40 +872,110 @@ class GlobalInputMonitor:
         self.stop()
         self._ready = threading.Event()
         self._thread_id = 0
-        self._hook = None
+        self._mouse_hook = None
+        self._keyboard_hook = None
         self.start()
+
+    def begin_binding_capture(self) -> None:
+        with self._input_lock:
+            self._capture_next = True
+
+    def cancel_binding_capture(self) -> None:
+        with self._input_lock:
+            self._capture_next = False
+
+    def _handle_input_event(self, code: str, label: str, down: bool) -> bool:
+        with self._input_lock:
+            if down:
+                if code in self._pressed_inputs:
+                    return code in self._suppressed_inputs
+                self._pressed_inputs.add(code)
+                if self._capture_next:
+                    self._capture_next = False
+                    self._suppressed_inputs.add(code)
+                    self.notify("binding_captured", code, label)
+                    return True
+            else:
+                self._pressed_inputs.discard(code)
+                if code in self._suppressed_inputs:
+                    self._suppressed_inputs.discard(code)
+                    return True
+
+        if down:
+            for binding_code, duration_ms, enabled in self.engine.config.pause_bindings:
+                if enabled and binding_code == code:
+                    self.engine.trigger_key_pause(code, label, duration_ms)
+                    break
+        return False
 
     def _message_loop(self) -> None:
         self._thread_id = kernel32.GetCurrentThreadId()
 
-        def low_level_proc(code, w_param, l_param):
+        def mouse_proc(code, w_param, l_param):
             if code >= 0:
                 data = ctypes.cast(l_param, ctypes.POINTER(MSLLHOOKSTRUCT)).contents
                 if not (data.flags & LLMHF_INJECTED) and data.dwExtraInfo != INJECTED_MARKER:
                     event_map = {
-                        WM_LBUTTONDOWN: ("left", True),
-                        WM_LBUTTONUP: ("left", False),
-                        WM_RBUTTONDOWN: ("right", True),
-                        WM_RBUTTONUP: ("right", False),
-                        WM_MBUTTONDOWN: ("middle", True),
-                        WM_MBUTTONUP: ("middle", False),
+                        WM_LBUTTONDOWN: ("left", "M:LEFT", "鼠标左键", True),
+                        WM_LBUTTONUP: ("left", "M:LEFT", "鼠标左键", False),
+                        WM_RBUTTONDOWN: ("right", "M:RIGHT", "鼠标右键", True),
+                        WM_RBUTTONUP: ("right", "M:RIGHT", "鼠标右键", False),
+                        WM_MBUTTONDOWN: ("middle", "M:MIDDLE", "鼠标中键", True),
+                        WM_MBUTTONUP: ("middle", "M:MIDDLE", "鼠标中键", False),
                     }
                     mapped = event_map.get(int(w_param))
+                    if int(w_param) in {WM_XBUTTONDOWN, WM_XBUTTONUP}:
+                        side = (int(data.mouseData) >> 16) & 0xFFFF
+                        if side in {1, 2}:
+                            mapped = (
+                                None,
+                                f"M:X{side}",
+                                f"鼠标侧键 {side}",
+                                int(w_param) == WM_XBUTTONDOWN,
+                            )
                     if mapped:
-                        button, down = mapped
-                        if down:
-                            suppress = self.engine.physical_down(button)
-                        else:
-                            suppress = self.engine.physical_up(button)
+                        button, input_code, label, down = mapped
+                        suppress = self._handle_input_event(input_code, label, down)
+                        if not suppress and button is not None:
+                            if down:
+                                suppress = self.engine.physical_down(button)
+                            else:
+                                suppress = self.engine.physical_up(button)
                         if suppress:
                             return 1
-            return user32.CallNextHookEx(self._hook, code, w_param, l_param)
+            return user32.CallNextHookEx(self._mouse_hook, code, w_param, l_param)
 
-        self._callback = LOW_LEVEL_MOUSE_PROC(low_level_proc)
-        self._hook = user32.SetWindowsHookExW(WH_MOUSE_LL, self._callback, None, 0)
-        if not self._hook:
+        def keyboard_proc(code, w_param, l_param):
+            if code >= 0:
+                data = ctypes.cast(l_param, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
+                if not (data.flags & LLKHF_INJECTED) and data.dwExtraInfo != INJECTED_MARKER:
+                    message = int(w_param)
+                    if message in {WM_KEYDOWN, WM_SYSKEYDOWN, WM_KEYUP, WM_SYSKEYUP}:
+                        input_code = keyboard_code(int(data.vkCode))
+                        down = message in {WM_KEYDOWN, WM_SYSKEYDOWN}
+                        if self._handle_input_event(
+                            input_code, input_code_label(input_code), down
+                        ):
+                            return 1
+            return user32.CallNextHookEx(self._keyboard_hook, code, w_param, l_param)
+
+        self._mouse_callback = LOW_LEVEL_HOOK_PROC(mouse_proc)
+        self._keyboard_callback = LOW_LEVEL_HOOK_PROC(keyboard_proc)
+        self._mouse_hook = user32.SetWindowsHookExW(
+            WH_MOUSE_LL, self._mouse_callback, None, 0
+        )
+        self._keyboard_hook = user32.SetWindowsHookExW(
+            WH_KEYBOARD_LL, self._keyboard_callback, None, 0
+        )
+        if not self._mouse_hook or not self._keyboard_hook:
             error = ctypes.get_last_error()
-            self.notify("error", f"无法监听鼠标（系统错误 {error}）。")
+            if self._mouse_hook:
+                user32.UnhookWindowsHookEx(self._mouse_hook)
+            if self._keyboard_hook:
+                user32.UnhookWindowsHookEx(self._keyboard_hook)
+            self._mouse_hook = None
+            self._keyboard_hook = None
+            self.notify("error", f"无法监听键盘或鼠标（系统错误 {error}）。")
             self._ready.set()
             return
 
@@ -668,9 +1002,12 @@ class GlobalInputMonitor:
 
         user32.UnregisterHotKey(None, HOTKEY_TOGGLE_ID)
         user32.UnregisterHotKey(None, HOTKEY_PANIC_ID)
-        if self._hook:
-            user32.UnhookWindowsHookEx(self._hook)
-        self._hook = None
+        if self._mouse_hook:
+            user32.UnhookWindowsHookEx(self._mouse_hook)
+        if self._keyboard_hook:
+            user32.UnhookWindowsHookEx(self._keyboard_hook)
+        self._mouse_hook = None
+        self._keyboard_hook = None
 
 
 class App:
@@ -691,6 +1028,8 @@ class App:
         self.engine = ClickEngine(self.config, self.post_event)
         self.monitor = GlobalInputMonitor(self.engine, self.post_event)
         self.screen_detector: ScreenStateDetector | None = None
+        self.pause_rule_rows: list[dict] = []
+        self._capturing_rule: dict | None = None
         self._status = "waiting" if self.config.start_enabled else "paused"
 
         self._build_window()
@@ -704,7 +1043,7 @@ class App:
 
     def _build_window(self) -> None:
         self.root.title(f"{APP_NAME}  {APP_VERSION}")
-        self.root.geometry("700x800")
+        self.root.geometry("720x900")
         self.root.minsize(670, 650)
         self.root.configure(bg=self.BG)
         try:
@@ -829,6 +1168,28 @@ class App:
         ).pack(anchor="w", pady=(5, 0))
         ttk.Checkbutton(options, text="下次启动时自动启用", variable=self.start_var).pack(anchor="w", pady=(5, 0))
 
+        pause_card = ttk.Frame(outer, style="Card.TFrame", padding=(18, 16))
+        pause_card.pack(fill="x", pady=(12, 0))
+        pause_header = ttk.Frame(pause_card, style="Card.TFrame")
+        pause_header.pack(fill="x")
+        ttk.Label(
+            pause_header,
+            text="按键预暂停规则",
+            style="Card.TLabel",
+            font=("Microsoft YaHei UI", 11, "bold"),
+        ).pack(side="left")
+        ttk.Button(pause_header, text="＋ 添加按键", command=self._add_pause_rule).pack(side="right")
+        ttk.Label(
+            pause_card,
+            text="点击按键输入框后直接按键；支持键盘、鼠标中键和侧键。每个按键可设置独立暂停时间。",
+            style="Muted.Card.TLabel",
+            wraplength=620,
+            justify="left",
+        ).pack(anchor="w", pady=(5, 10))
+        self.pause_rules_container = ttk.Frame(pause_card, style="Card.TFrame")
+        self.pause_rules_container.pack(fill="x")
+        self._replace_pause_rule_rows(self.config.pause_bindings)
+
         footer = ttk.Frame(outer)
         footer.pack(fill="x", pady=(14, 0))
         self.feedback = ttk.Label(footer, text="", style="Subtitle.TLabel")
@@ -911,6 +1272,8 @@ class App:
                     )
                 elif name == "guard_error":
                     self.guard_label.configure(text=f"界面检测：已停止 · {args[0]}")
+                elif name == "binding_captured":
+                    self._accept_binding_capture(args[0], args[1])
         except queue.Empty:
             pass
         self.root.after(50, self._drain_events)
@@ -940,8 +1303,152 @@ class App:
             return
         self.engine.toggle("ui")
 
+    def _replace_pause_rule_rows(self, bindings) -> None:
+        self.monitor.cancel_binding_capture()
+        self._capturing_rule = None
+        self.pause_rule_rows = []
+        for code, duration, enabled in normalized_pause_bindings(bindings):
+            self.pause_rule_rows.append(
+                {
+                    "code": code,
+                    "key_var": tk.StringVar(value=input_code_label(code)),
+                    "duration_var": tk.StringVar(value=str(duration)),
+                    "enabled_var": tk.BooleanVar(value=enabled),
+                }
+            )
+        self._render_pause_rules()
+
+    def _render_pause_rules(self) -> None:
+        for child in self.pause_rules_container.winfo_children():
+            child.destroy()
+        if not self.pause_rule_rows:
+            ttk.Label(
+                self.pause_rules_container,
+                text="尚未添加规则。按键暂停和图标检测可以同时使用。",
+                style="Muted.Card.TLabel",
+            ).pack(anchor="w", pady=(2, 4))
+            return
+
+        headings = ttk.Frame(self.pause_rules_container, style="Card.TFrame")
+        headings.pack(fill="x", pady=(0, 4))
+        ttk.Label(headings, text="启用", style="Muted.Card.TLabel", width=5).grid(row=0, column=0)
+        ttk.Label(headings, text="按键（点击后录入）", style="Muted.Card.TLabel").grid(row=0, column=1, sticky="w")
+        ttk.Label(headings, text="暂停时间", style="Muted.Card.TLabel").grid(row=0, column=2, sticky="e")
+        headings.columnconfigure(1, weight=1)
+
+        for index, row in enumerate(self.pause_rule_rows):
+            line = ttk.Frame(self.pause_rules_container, style="Card.TFrame")
+            line.pack(fill="x", pady=3)
+            ttk.Checkbutton(line, variable=row["enabled_var"]).grid(row=0, column=0, padx=(2, 8))
+            key_entry = ttk.Entry(
+                line,
+                textvariable=row["key_var"],
+                state="readonly",
+                width=24,
+            )
+            key_entry.grid(row=0, column=1, sticky="ew")
+            key_entry.bind("<Button-1>", lambda _event, item=row: self._begin_binding_capture(item))
+            duration = ttk.Spinbox(
+                line,
+                textvariable=row["duration_var"],
+                from_=PAUSE_MIN_MS,
+                to=PAUSE_MAX_MS,
+                increment=10,
+                width=8,
+                justify="right",
+            )
+            duration.grid(row=0, column=2, padx=(10, 5))
+            ttk.Label(line, text="ms", style="Muted.Card.TLabel").grid(row=0, column=3)
+            ttk.Button(
+                line,
+                text="删除",
+                command=lambda item=row: self._delete_pause_rule(item),
+            ).grid(row=0, column=4, padx=(10, 0))
+            line.columnconfigure(1, weight=1)
+
+    def _add_pause_rule(self) -> None:
+        if len(self.pause_rule_rows) >= MAX_PAUSE_BINDINGS:
+            messagebox.showinfo("规则已满", f"最多可以添加 {MAX_PAUSE_BINDINGS} 条按键暂停规则。")
+            return
+        row = {
+            "code": "",
+            "key_var": tk.StringVar(value="点击这里，然后按键"),
+            "duration_var": tk.StringVar(value="250"),
+            "enabled_var": tk.BooleanVar(value=True),
+        }
+        self.pause_rule_rows.append(row)
+        self._render_pause_rules()
+
+    def _delete_pause_rule(self, row: dict) -> None:
+        if self._capturing_rule is row:
+            self.monitor.cancel_binding_capture()
+            self._capturing_rule = None
+        if row in self.pause_rule_rows:
+            self.pause_rule_rows.remove(row)
+        self._render_pause_rules()
+
+    def _begin_binding_capture(self, row: dict) -> None:
+        if self._capturing_rule is not None and self._capturing_rule is not row:
+            previous = self._capturing_rule
+            previous["key_var"].set(
+                input_code_label(previous["code"])
+                if previous["code"]
+                else "点击这里，然后按键"
+            )
+        self._capturing_rule = row
+        row["key_var"].set("请按键盘键或鼠标键…")
+        self.monitor.begin_binding_capture()
+        self.feedback.configure(text="正在捕获下一次按键；该次输入不会传给游戏")
+
+    def _accept_binding_capture(self, code: str, label: str) -> None:
+        row = self._capturing_rule
+        self._capturing_rule = None
+        if row is None:
+            return
+        duplicate = next(
+            (item for item in self.pause_rule_rows if item is not row and item["code"] == code),
+            None,
+        )
+        toggle_code = keyboard_code(HOTKEYS.get(self.hotkey_var.get(), HOTKEYS["F8"]))
+        trigger_code = f"M:{LABEL_TO_BUTTON.get(self.button_var.get(), 'left').upper()}"
+        if duplicate is not None:
+            error = f"{label} 已经存在于另一条规则中。"
+        elif code == keyboard_code(VK_F12):
+            error = "F12 是紧急停止键，不能绑定。"
+        elif code == toggle_code:
+            error = f"{self.hotkey_var.get()} 是暂停/继续快捷键，不能绑定。"
+        elif code == trigger_code:
+            error = f"{label} 是当前连点触发键，不能绑定。"
+        else:
+            error = ""
+
+        if error:
+            row["key_var"].set(
+                input_code_label(row["code"]) if row["code"] else "点击这里，然后按键"
+            )
+            self.feedback.configure(text=error)
+            self.root.after(3500, lambda: self.feedback.configure(text=""))
+            return
+        row["code"] = code
+        row["key_var"].set(label)
+        self.feedback.configure(text=f"已识别：{label}；设置暂停时间后点击“保存并应用”")
+        self.root.after(3500, lambda: self.feedback.configure(text=""))
+
     def apply(self) -> None:
         try:
+            pause_bindings = []
+            for row in self.pause_rule_rows:
+                if not row["code"]:
+                    if row["enabled_var"].get():
+                        raise ValueError("存在尚未录入按键的规则")
+                    continue
+                pause_bindings.append(
+                    (
+                        row["code"],
+                        int(row["duration_var"].get()),
+                        row["enabled_var"].get(),
+                    )
+                )
             new_config = AppConfig(
                 clicks_per_minute=int(self.cpm_var.get()),
                 jitter_percent=float(self.jitter_var.get()),
@@ -953,11 +1460,19 @@ class App:
                 natural_rhythm=self.natural_var.get(),
                 sound_enabled=self.sound_var.get(),
                 screen_guard_enabled=self.screen_guard_var.get(),
+                pause_bindings=tuple(pause_bindings),
                 start_enabled=self.start_var.get(),
             )
+            conflict = binding_conflict_message(new_config)
+            if conflict:
+                messagebox.showerror("按键冲突", conflict)
+                return
             validated = new_config.validated()
         except (ValueError, KeyError):
-            messagebox.showerror("设置无效", "频率、波动和长按阈值必须是有效数字。")
+            messagebox.showerror(
+                "设置无效",
+                "请检查频率、波动、长按阈值、按键暂停时间，并确认每条启用规则都已录入按键。",
+            )
             return
 
         old_hotkey = self.config.toggle_hotkey
@@ -974,6 +1489,7 @@ class App:
         self.cpm_var.set(str(validated.clicks_per_minute))
         self.jitter_var.set(f"{validated.jitter_percent:g}")
         self.threshold_var.set(str(validated.hold_threshold_ms))
+        self._replace_pause_rule_rows(validated.pause_bindings)
         if old_screen_guard != validated.screen_guard_enabled:
             if validated.screen_guard_enabled:
                 self._start_screen_detector()
@@ -981,7 +1497,7 @@ class App:
                 self._stop_screen_detector()
         self.feedback.configure(text="设置已保存并立即生效")
         self.root.after(2500, lambda: self.feedback.configure(text=""))
-        blocked, reason = self.engine.screen_block
+        blocked, reason = self.engine.auto_block
         self._set_status(
             "guarded" if self.engine.enabled and blocked else (
                 "waiting" if self.engine.enabled else "paused"
