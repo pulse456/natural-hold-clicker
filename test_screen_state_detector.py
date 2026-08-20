@@ -76,9 +76,10 @@ class RecognitionTests(unittest.TestCase):
 
 
 class DetectorTransitionTests(unittest.TestCase):
-    def test_one_positive_frame_blocks_and_two_clear_frames_resume(self):
+    def run_sequence(self, clear_frames, scores):
         transitions = []
         resumed = threading.Event()
+        instances = []
 
         class FakeGrabber:
             name = "fake"
@@ -90,26 +91,23 @@ class DetectorTransitionTests(unittest.TestCase):
         class FakeMonitor:
             def __init__(self, **_kwargs):
                 self.grabber = FakeGrabber()
-                self.scores = iter(
-                    [
-                        (THRESH_MOUSE + 0.1, 0.0),
-                        (0.0, 0.0),
-                        (0.0, 0.0),
-                    ]
-                )
+                self.scores = iter(scores)
+                self.calls = 0
+                instances.append(self)
 
             def check_capture(self, _frame):
+                self.calls += 1
                 try:
                     return next(self.scores)
                 except StopIteration:
-                    return 0.0, 0.0
+                    return THRESH_MOUSE + 0.1, 0.0
 
             @staticmethod
             def close():
                 pass
 
         def on_state(blocked, reason, *_scores):
-            transitions.append((blocked, reason))
+            transitions.append((blocked, reason, instances[0].calls))
             if not blocked:
                 resumed.set()
 
@@ -117,20 +115,42 @@ class DetectorTransitionTests(unittest.TestCase):
             ASSETS,
             on_state,
             lambda _text: None,
-            lambda error: self.fail(error),
+            lambda error: transitions.append(("error", error, 0)),
             interval=0.010,
             monitor_factory=FakeMonitor,
+            clear_frames=clear_frames,
         )
         detector.start()
         try:
             self.assertTrue(resumed.wait(0.5))
         finally:
             detector.stop()
+        return transitions
 
-        self.assertEqual(
-            transitions,
-            [(True, "技能鼠标图标"), (False, "")],
-        )
+    def test_configured_number_of_clear_frames_is_required(self):
+        for clear_frames in (1, 2, 3, 4):
+            with self.subTest(clear_frames=clear_frames):
+                scores = [(THRESH_MOUSE + 0.1, 0.0)] + [(0.0, 0.0)] * clear_frames
+                transitions = self.run_sequence(clear_frames, scores)
+                self.assertEqual(
+                    transitions,
+                    [
+                        (True, "技能鼠标图标", 1),
+                        (False, "", 1 + clear_frames),
+                    ],
+                )
+
+    def test_uncertain_frame_resets_clear_streak(self):
+        scores = [
+            (THRESH_MOUSE + 0.1, 0.0),
+            (0.0, 0.0),
+            (THRESH_MOUSE - 0.04, 0.0),
+            (0.0, 0.0),
+            (0.0, 0.0),
+            (0.0, 0.0),
+        ]
+        transitions = self.run_sequence(3, scores)
+        self.assertEqual(transitions[-1], (False, "", 6))
 
 
 if __name__ == "__main__":

@@ -18,7 +18,7 @@ REGION_CLOCK = (1806, 15, 41, 46)
 THRESH_MOUSE = 0.62
 THRESH_CLOCK = 0.50
 CLEAR_MARGIN = 0.08
-CLEAR_FRAMES = 2
+DEFAULT_CLEAR_FRAMES = 3
 CHECK_INTERVAL = 0.025
 
 MOUSE_TEMPLATE_FILES = (
@@ -280,6 +280,7 @@ class ScreenStateDetector:
         interval: float = CHECK_INTERVAL,
         capture_backend: str = "auto",
         monitor_factory: Callable[..., VisualStateMonitor] = VisualStateMonitor,
+        clear_frames: int = DEFAULT_CLEAR_FRAMES,
     ) -> None:
         self.assets_dir = Path(assets_dir)
         self.on_state = on_state
@@ -288,6 +289,7 @@ class ScreenStateDetector:
         self.interval = max(0.010, float(interval))
         self.capture_backend = capture_backend
         self.monitor_factory = monitor_factory
+        self.clear_frames = max(1, min(10, int(clear_frames)))
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
 
@@ -303,6 +305,9 @@ class ScreenStateDetector:
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=1.5)
         self._thread = None
+
+    def set_clear_frames(self, clear_frames: int) -> None:
+        self.clear_frames = max(1, min(10, int(clear_frames)))
 
     def _run(self) -> None:
         monitor: VisualStateMonitor | None = None
@@ -341,7 +346,7 @@ class ScreenStateDetector:
                         and clock_score < THRESH_CLOCK - CLEAR_MARGIN
                     )
                     clear_frames = clear_frames + 1 if clearly_absent else 0
-                    if clear_frames >= CLEAR_FRAMES:
+                    if clear_frames >= self.clear_frames:
                         blocked = False
                         blocked_reason = ""
                         clear_frames = 0

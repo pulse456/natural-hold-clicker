@@ -21,7 +21,7 @@ from screen_state_detector import ScreenStateDetector, make_dpi_aware
 
 
 APP_NAME = "自然长按连点器"
-APP_VERSION = "1.5.1"
+APP_VERSION = "1.6.0"
 INJECTED_MARKER = 0xC0DEC11C
 SINGLE_INSTANCE_MUTEX = "Local\\NaturalHoldClicker.SingleInstance"
 ERROR_ALREADY_EXISTS = 183
@@ -186,6 +186,7 @@ class AppConfig:
     natural_rhythm: bool = True
     sound_enabled: bool = True
     screen_guard_enabled: bool = False
+    visual_clear_frames: int = 3
     pause_bindings: tuple[tuple[str, int, bool], ...] = ()
     start_enabled: bool = True
 
@@ -202,6 +203,7 @@ class AppConfig:
             natural_rhythm=bool(self.natural_rhythm),
             sound_enabled=bool(self.sound_enabled),
             screen_guard_enabled=bool(self.screen_guard_enabled),
+            visual_clear_frames=max(1, min(10, int(self.visual_clear_frames))),
             pause_bindings=normalized_pause_bindings(self.pause_bindings),
             start_enabled=bool(self.start_enabled),
         )
@@ -1120,6 +1122,7 @@ class App:
         self.natural_var = tk.BooleanVar(value=self.config.natural_rhythm)
         self.sound_var = tk.BooleanVar(value=self.config.sound_enabled)
         self.screen_guard_var = tk.BooleanVar(value=self.config.screen_guard_enabled)
+        self.visual_clear_frames_var = tk.StringVar(value=str(self.config.visual_clear_frames))
         self.start_var = tk.BooleanVar(value=self.config.start_enabled)
 
         self._setting_row(settings, 0, "点击频率", "每分钟 30–3000 次", self._spin(settings, self.cpm_var, 30, 3000, 10), "次/min")
@@ -1157,8 +1160,17 @@ class App:
         hotkey_box = ttk.Combobox(settings, textvariable=self.hotkey_var, values=list(HOTKEYS), state="readonly", width=13)
         self._setting_row(settings, 6, "暂停/继续", "全局快捷键；F12 始终紧急停止", hotkey_box, "")
 
+        self._setting_row(
+            settings,
+            7,
+            "图标消失确认",
+            "两种图标连续未检出多少帧后恢复；推荐 3",
+            self._spin(settings, self.visual_clear_frames_var, 1, 10, 1),
+            "帧",
+        )
+
         options = ttk.Frame(settings, style="Card.TFrame")
-        options.grid(row=7, column=0, columnspan=4, sticky="ew", pady=(14, 0))
+        options.grid(row=8, column=0, columnspan=4, sticky="ew", pady=(14, 0))
         ttk.Checkbutton(options, text="自然节奏（轻微漂移和低概率短停顿）", variable=self.natural_var).pack(anchor="w")
         ttk.Checkbutton(options, text="状态提示音（开启升调、暂停降调）", variable=self.sound_var).pack(anchor="w", pady=(5, 0))
         ttk.Checkbutton(
@@ -1460,6 +1472,7 @@ class App:
                 natural_rhythm=self.natural_var.get(),
                 sound_enabled=self.sound_var.get(),
                 screen_guard_enabled=self.screen_guard_var.get(),
+                visual_clear_frames=int(self.visual_clear_frames_var.get()),
                 pause_bindings=tuple(pause_bindings),
                 start_enabled=self.start_var.get(),
             )
@@ -1477,6 +1490,7 @@ class App:
 
         old_hotkey = self.config.toggle_hotkey
         old_screen_guard = self.config.screen_guard_enabled
+        old_visual_clear_frames = self.config.visual_clear_frames
         self.config = validated
         self.engine.update_config(validated)
         try:
@@ -1489,12 +1503,19 @@ class App:
         self.cpm_var.set(str(validated.clicks_per_minute))
         self.jitter_var.set(f"{validated.jitter_percent:g}")
         self.threshold_var.set(str(validated.hold_threshold_ms))
+        self.visual_clear_frames_var.set(str(validated.visual_clear_frames))
         self._replace_pause_rule_rows(validated.pause_bindings)
         if old_screen_guard != validated.screen_guard_enabled:
             if validated.screen_guard_enabled:
                 self._start_screen_detector()
             else:
                 self._stop_screen_detector()
+        elif (
+            validated.screen_guard_enabled
+            and old_visual_clear_frames != validated.visual_clear_frames
+            and self.screen_detector is not None
+        ):
+            self.screen_detector.set_clear_frames(validated.visual_clear_frames)
         self.feedback.configure(text="设置已保存并立即生效")
         self.root.after(2500, lambda: self.feedback.configure(text=""))
         blocked, reason = self.engine.auto_block
@@ -1514,6 +1535,7 @@ class App:
             self._on_guard_state,
             lambda text: self.post_event("guard_status", text),
             self._on_guard_error,
+            clear_frames=self.config.visual_clear_frames,
         )
         self.screen_detector.start()
 

@@ -23,12 +23,14 @@ class ConfigTests(unittest.TestCase):
             clicks_per_minute=99999,
             jitter_percent=-2,
             hold_threshold_ms=0,
+            visual_clear_frames=99,
             activation_mode="unknown",
             injection_mode="unknown",
         ).validated()
         self.assertEqual(config.clicks_per_minute, 3000)
         self.assertEqual(config.jitter_percent, 0)
         self.assertEqual(config.hold_threshold_ms, 30)
+        self.assertEqual(config.visual_clear_frames, 10)
         self.assertEqual(config.activation_mode, "stable")
         self.assertEqual(config.injection_mode, "sendinput")
 
