@@ -282,7 +282,7 @@ class ScreenStateDetector:
         capture_backend: str = "auto",
         monitor_factory: Callable[..., VisualStateMonitor] = VisualStateMonitor,
         clear_frames: int = DEFAULT_CLEAR_FRAMES,
-        is_trigger_held: Callable[[], bool] | None = None,
+        is_guard_latched: Callable[[], bool] | None = None,
     ) -> None:
         self.assets_dir = Path(assets_dir)
         self.on_state = on_state
@@ -292,7 +292,7 @@ class ScreenStateDetector:
         self.capture_backend = capture_backend
         self.monitor_factory = monitor_factory
         self.clear_frames = max(1, min(10, int(clear_frames)))
-        self.is_trigger_held = is_trigger_held or (lambda: False)
+        self.is_guard_latched = is_guard_latched or (lambda: False)
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
 
@@ -344,11 +344,11 @@ class ScreenStateDetector:
                         blocked_reason = reason
                         self.on_state(True, reason, mouse_score, clock_score)
                 elif blocked:
-                    # A transient miss must never re-arm automatic clicking while
-                    # the user is still physically holding the trigger. Positive
-                    # detections remain active above, so icons that appear only
-                    # after mouse-down can still enter the guarded state.
-                    if self.is_trigger_held():
+                    # The engine decides the visual policy once per physical press.
+                    # Only a press that began guarded keeps detector recovery latched;
+                    # a press that began clear may continue updating raw detector state
+                    # without changing that press's effective clicking policy.
+                    if self.is_guard_latched():
                         clear_frames = 0
                     else:
                         clearly_absent = (

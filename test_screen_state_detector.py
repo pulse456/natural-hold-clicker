@@ -76,7 +76,7 @@ class RecognitionTests(unittest.TestCase):
 
 
 class DetectorTransitionTests(unittest.TestCase):
-    def run_sequence(self, clear_frames, scores, is_trigger_held=None):
+    def run_sequence(self, clear_frames, scores, is_guard_latched=None):
         transitions = []
         resumed = threading.Event()
         instances = []
@@ -119,7 +119,7 @@ class DetectorTransitionTests(unittest.TestCase):
             interval=0.010,
             monitor_factory=FakeMonitor,
             clear_frames=clear_frames,
-            is_trigger_held=is_trigger_held,
+            is_guard_latched=is_guard_latched,
         )
         detector.start()
         try:
@@ -153,11 +153,11 @@ class DetectorTransitionTests(unittest.TestCase):
         transitions = self.run_sequence(3, scores)
         self.assertEqual(transitions[-1], (False, "", 6))
 
-    def test_guard_cannot_clear_until_physical_trigger_is_released(self):
-        held = True
+    def test_guard_cannot_clear_while_engine_latch_is_active(self):
+        latched = True
 
-        def is_trigger_held():
-            return held
+        def is_guard_latched():
+            return latched
 
         transitions = []
         resumed = threading.Event()
@@ -195,13 +195,13 @@ class DetectorTransitionTests(unittest.TestCase):
             interval=0.010,
             monitor_factory=FakeMonitor,
             clear_frames=2,
-            is_trigger_held=is_trigger_held,
+            is_guard_latched=is_guard_latched,
         )
         detector.start()
         try:
             self.assertTrue(detector._thread)
             self.assertFalse(resumed.wait(0.08))
-            held = False
+            latched = False
             self.assertTrue(resumed.wait(0.15))
         finally:
             detector.stop()

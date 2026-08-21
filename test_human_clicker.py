@@ -31,6 +31,7 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.jitter_percent, 0)
         self.assertEqual(config.hold_threshold_ms, 30)
         self.assertEqual(config.visual_clear_frames, 10)
+        self.assertFalse(config.natural_hesitation)
         self.assertEqual(config.activation_mode, "stable")
         self.assertEqual(config.injection_mode, "sendinput")
 
@@ -75,8 +76,19 @@ class HumanRhythmTests(unittest.TestCase):
 
     def test_all_intervals_remain_positive_at_max_settings(self):
         rhythm = HumanRhythm(random.Random(7))
-        values = [rhythm.next_interval(3000, 50, True) for _ in range(5000)]
+        values = [rhythm.next_interval(3000, 50, True, True) for _ in range(5000)]
         self.assertTrue(all(value >= 0.008 for value in values))
+
+    def test_hesitation_is_separate_and_disabled_by_default(self):
+        base = 0.1
+        without = HumanRhythm(random.Random(9))
+        with_hesitation = HumanRhythm(random.Random(9))
+        normal_values = [without.next_interval(600, 12, True) for _ in range(10000)]
+        hesitation_values = [
+            with_hesitation.next_interval(600, 12, True, True) for _ in range(10000)
+        ]
+        self.assertLessEqual(max(normal_values), base * 1.12 + 1e-9)
+        self.assertGreater(max(hesitation_values), base * 1.30)
 
 class ActivationModeTests(unittest.TestCase):
     def test_available_modes_never_suppress_native_click(self):
@@ -134,8 +146,7 @@ class ScreenGuardTests(unittest.TestCase):
         engine.set_screen_blocked(False)
         self.assertFalse(any(event[0] == "sound" for event in events))
 
-    def test_clearing_guard_restarts_held_press(self):
-        clicked = threading.Event()
+    def test_guarded_state_at_press_is_latched_until_release(self):
         engine = ClickEngine(
             AppConfig(
                 hold_threshold_ms=30,
@@ -148,18 +159,30 @@ class ScreenGuardTests(unittest.TestCase):
         )
         engine.set_screen_blocked(True, "技能鼠标图标")
         engine.physical_down("left")
-
-        def send(*_args):
-            clicked.set()
-            return True
-
-        with patch("human_clicker.send_button_event", side_effect=send):
+        with patch("human_clicker.send_button_event") as sender:
             engine.set_screen_blocked(False)
-            self.assertTrue(clicked.wait(0.15))
+            time.sleep(0.06)
+            self.assertTrue(engine.auto_block[0])
+            self.assertTrue(engine.visual_guard_latched)
+            sender.assert_not_called()
             engine.physical_up("left")
-            engine._worker.join(timeout=0.5)
+        self.assertEqual(engine.auto_block, (False, ""))
 
-    def test_late_guard_restores_continuous_physical_hold(self):
+    def test_clear_state_at_press_ignores_late_visual_block(self):
+        engine = ClickEngine(
+            AppConfig(hold_threshold_ms=1500, start_enabled=True),
+            lambda *args: None,
+        )
+        engine.physical_down("left")
+        engine.set_screen_blocked(True, "技能鼠标图标")
+        self.assertEqual(engine.auto_block, (False, ""))
+        self.assertFalse(engine.visual_guard_latched)
+        engine.physical_up("left")
+        engine._worker.join(timeout=0.5)
+        self.assertTrue(engine.auto_block[0])
+        engine.set_screen_blocked(False)
+
+    def test_explicit_key_pause_restores_continuous_physical_hold(self):
         initial_release = threading.Event()
         sent_states = []
         engine = ClickEngine(
@@ -180,11 +203,12 @@ class ScreenGuardTests(unittest.TestCase):
         with patch("human_clicker.send_button_event", side_effect=send):
             engine.physical_down("left")
             self.assertTrue(initial_release.wait(0.15))
-            engine.set_screen_blocked(True, "技能鼠标图标")
+            engine.trigger_key_pause("K:81", "Q", 1000)
             engine._worker.join(timeout=0.5)
             self.assertEqual(sent_states, [False, True])
             self.assertTrue(engine.physically_held)
             engine.physical_up("left")
+        engine.shutdown()
 
 
 class KeyPauseTests(unittest.TestCase):
@@ -213,6 +237,18 @@ class KeyPauseTests(unittest.TestCase):
         self.assertIn("技能鼠标图标", reason)
         self.assertNotIn("按键预暂停", reason)
         engine.set_screen_blocked(False)
+        self.assertEqual(engine.auto_block, (False, ""))
+        engine.shutdown()
+
+    def test_key_pause_active_at_mouse_down_latches_guard_for_that_hold(self):
+        engine = ClickEngine(AppConfig(start_enabled=True), lambda *args: None)
+        engine.trigger_key_pause("K:81", "Q", 30)
+        engine.physical_down("left")
+        time.sleep(0.07)
+        blocked, reason = engine.auto_block
+        self.assertTrue(blocked)
+        self.assertIn("本次按住锁定", reason)
+        engine.physical_up("left")
         self.assertEqual(engine.auto_block, (False, ""))
         engine.shutdown()
 

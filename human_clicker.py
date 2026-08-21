@@ -21,7 +21,7 @@ from screen_state_detector import ScreenStateDetector, make_dpi_aware
 
 
 APP_NAME = "自然长按连点器"
-APP_VERSION = "1.7.0"
+APP_VERSION = "1.8.0"
 INJECTED_MARKER = 0xC0DEC11C
 SINGLE_INSTANCE_MUTEX = "Local\\NaturalHoldClicker.SingleInstance"
 ERROR_ALREADY_EXISTS = 183
@@ -184,6 +184,7 @@ class AppConfig:
     injection_mode: str = "sendinput"
     toggle_hotkey: str = "F8"
     natural_rhythm: bool = True
+    natural_hesitation: bool = False
     sound_enabled: bool = True
     screen_guard_enabled: bool = False
     visual_clear_frames: int = 3
@@ -201,6 +202,7 @@ class AppConfig:
             injection_mode=self.injection_mode if self.injection_mode in INJECTION_LABELS else "sendinput",
             toggle_hotkey=self.toggle_hotkey if self.toggle_hotkey in HOTKEYS else "F8",
             natural_rhythm=bool(self.natural_rhythm),
+            natural_hesitation=bool(self.natural_hesitation),
             sound_enabled=bool(self.sound_enabled),
             screen_guard_enabled=bool(self.screen_guard_enabled),
             visual_clear_frames=max(1, min(10, int(self.visual_clear_frames))),
@@ -259,28 +261,38 @@ class HumanRhythm:
         self.rng = rng or random.Random()
         self._drift = 0.0
 
-    def next_interval(self, clicks_per_minute: int, jitter_percent: float, natural: bool) -> float:
+    def next_interval(
+        self,
+        clicks_per_minute: int,
+        jitter_percent: float,
+        natural: bool,
+        hesitation: bool = False,
+    ) -> float:
         base = 60.0 / clicks_per_minute
         jitter = jitter_percent / 100.0
-        if jitter <= 0:
+        if jitter <= 0 and not hesitation:
             return base
 
-        if natural:
+        if natural and jitter > 0:
             # Slow rhythm drift makes adjacent intervals related, as they are for a person.
             self._drift = 0.86 * self._drift + self.rng.gauss(0.0, jitter * 0.10)
             self._drift = max(-jitter * 0.42, min(jitter * 0.42, self._drift))
             local = self.rng.gauss(0.0, jitter * 0.34)
             factor = 1.0 + self._drift + local
+        elif jitter > 0:
+            factor = 1.0 + self.rng.uniform(-jitter, jitter)
+        else:
+            factor = 1.0
 
-            # A short hesitation is rare. The normalization keeps the long-run rate close
-            # to the requested CPM rather than systematically slowing it down.
+        if hesitation:
+            # A short hesitation is optional and independent from correlated drift.
+            # Normalization keeps the long-run rate close to the requested CPM.
             pause_probability = 0.018
             pause = self.rng.uniform(0.30, 0.75) if self.rng.random() < pause_probability else 0.0
             factor = (factor + pause) / (1.0 + pause_probability * 0.525)
-        else:
-            factor = 1.0 + self.rng.uniform(-jitter, jitter)
 
-        factor = max(1.0 - jitter, min(1.0 + max(jitter, 0.75), factor))
+        upper_variation = max(jitter, 0.75) if hesitation else jitter
+        factor = max(1.0 - jitter, min(1.0 + upper_variation, factor))
         return max(0.008, base * factor)
 
     def click_hold_time(self, interval: float, natural: bool) -> float:
@@ -501,6 +513,8 @@ class ClickEngine:
         self._generated_clicks = 0
         self._screen_blocked = False
         self._screen_block_reason = ""
+        self._hold_guarded: bool | None = None
+        self._hold_guard_reason = ""
         self._key_pauses: dict[str, tuple[float, str]] = {}
         self._key_pause_timer: threading.Timer | None = None
 
@@ -524,6 +538,11 @@ class ClickEngine:
         with self._lock:
             return self._physically_held
 
+    @property
+    def visual_guard_latched(self) -> bool:
+        with self._lock:
+            return self._physically_held and self._hold_guarded is True
+
     def update_config(self, config: AppConfig) -> None:
         pause_bindings_changed = False
         with self._lock:
@@ -537,6 +556,8 @@ class ClickEngine:
             if input_changed:
                 self._press_token += 1
                 self._physically_held = False
+                self._hold_guarded = None
+                self._hold_guard_reason = ""
                 self._cancel.set()
         if pause_bindings_changed:
             self.clear_key_pauses()
@@ -547,6 +568,17 @@ class ClickEngine:
                 return False
             self._physical_presses += 1
             self._notify("stats", self._physical_presses, self._generated_clicks)
+            self._prune_key_pauses_locked()
+            initial_reasons: list[str] = []
+            if self._screen_blocked:
+                initial_reasons.append(self._screen_block_reason or "界面图标")
+            if self._key_pauses:
+                labels = sorted({label for _deadline, label in self._key_pauses.values()})
+                initial_reasons.append(f"按键预暂停：{' / '.join(labels)}")
+            self._hold_guarded = bool(initial_reasons)
+            self._hold_guard_reason = (
+                f"本次按住锁定：{'；'.join(initial_reasons)}" if initial_reasons else ""
+            )
             self._physically_held = True
             self._press_token += 1
             token = self._press_token
@@ -572,6 +604,8 @@ class ClickEngine:
             if button != self._config.trigger_button:
                 return False
             self._physically_held = False
+            self._hold_guarded = None
+            self._hold_guard_reason = ""
             self._press_token += 1
             self._cancel.set()
             blocked, reason = self._block_snapshot_locked()
@@ -608,6 +642,8 @@ class ClickEngine:
         with self._lock:
             self._enabled = False
             self._physically_held = False
+            self._hold_guarded = None
+            self._hold_guard_reason = ""
             self._press_token += 1
             self._cancel.set()
             self._key_pauses.clear()
@@ -627,11 +663,14 @@ class ClickEngine:
         if prune:
             self._prune_key_pauses_locked(now)
         reasons: list[str] = []
-        if self._screen_blocked:
-            reasons.append(self._screen_block_reason or "界面图标")
-        if self._key_pauses:
-            labels = sorted({label for _deadline, label in self._key_pauses.values()})
-            reasons.append(f"按键预暂停：{' / '.join(labels)}")
+        if self._physically_held and self._hold_guarded is True:
+            reasons.append(self._hold_guard_reason or "本次按住锁定保护")
+        else:
+            if not self._physically_held and self._screen_blocked:
+                reasons.append(self._screen_block_reason or "界面图标")
+            if self._key_pauses:
+                labels = sorted({label for _deadline, label in self._key_pauses.values()})
+                reasons.append(f"按键预暂停：{' / '.join(labels)}")
         return bool(reasons), "；".join(reasons)
 
     def _restart_held_locked(self):
@@ -817,7 +856,10 @@ class ClickEngine:
                 started = time.perf_counter()
                 config = self.config
                 interval = self._rhythm.next_interval(
-                    config.clicks_per_minute, config.jitter_percent, config.natural_rhythm
+                    config.clicks_per_minute,
+                    config.jitter_percent,
+                    config.natural_rhythm,
+                    config.natural_hesitation,
                 )
                 if initial_config.activation_mode == "progressive":
                     ramp = max(0.0, 1.0 - (started - progressive_started) / 0.350)
@@ -1137,6 +1179,7 @@ class App:
         self.injection_var = tk.StringVar(value=INJECTION_LABELS[self.config.injection_mode])
         self.hotkey_var = tk.StringVar(value=self.config.toggle_hotkey)
         self.natural_var = tk.BooleanVar(value=self.config.natural_rhythm)
+        self.hesitation_var = tk.BooleanVar(value=self.config.natural_hesitation)
         self.sound_var = tk.BooleanVar(value=self.config.sound_enabled)
         self.screen_guard_var = tk.BooleanVar(value=self.config.screen_guard_enabled)
         self.visual_clear_frames_var = tk.StringVar(value=str(self.config.visual_clear_frames))
@@ -1188,7 +1231,12 @@ class App:
 
         options = ttk.Frame(settings, style="Card.TFrame")
         options.grid(row=8, column=0, columnspan=4, sticky="ew", pady=(14, 0))
-        ttk.Checkbutton(options, text="自然节奏（轻微漂移和低概率短停顿）", variable=self.natural_var).pack(anchor="w")
+        ttk.Checkbutton(options, text="自然节奏漂移（相邻点击轻微关联）", variable=self.natural_var).pack(anchor="w")
+        ttk.Checkbutton(
+            options,
+            text="低概率短停顿（默认关闭；可能产生可感知的节奏空隙）",
+            variable=self.hesitation_var,
+        ).pack(anchor="w", pady=(5, 0))
         ttk.Checkbutton(options, text="状态提示音（开启升调、暂停降调）", variable=self.sound_var).pack(anchor="w", pady=(5, 0))
         ttk.Checkbutton(
             options,
@@ -1288,8 +1336,10 @@ class App:
                 elif name == "guard_status":
                     self.guard_label.configure(text=f"界面检测：{args[0]}")
                 elif name == "guard_state":
-                    blocked, reason, mouse_score, clock_score = args
-                    if blocked:
+                    blocked, reason, mouse_score, clock_score, ignored_for_hold = args
+                    if ignored_for_hold:
+                        text = "检测到图标 · 本次按住已锁定连点"
+                    elif blocked:
                         text = f"已静默暂停 · {reason}"
                     else:
                         text = "监控中 · 未发现阻断图标"
@@ -1487,6 +1537,7 @@ class App:
                 injection_mode=LABEL_TO_INJECTION[self.injection_var.get()],
                 toggle_hotkey=self.hotkey_var.get(),
                 natural_rhythm=self.natural_var.get(),
+                natural_hesitation=self.hesitation_var.get(),
                 sound_enabled=self.sound_var.get(),
                 screen_guard_enabled=self.screen_guard_var.get(),
                 visual_clear_frames=int(self.visual_clear_frames_var.get()),
@@ -1553,7 +1604,7 @@ class App:
             lambda text: self.post_event("guard_status", text),
             self._on_guard_error,
             clear_frames=self.config.visual_clear_frames,
-            is_trigger_held=lambda: self.engine.physically_held,
+            is_guard_latched=lambda: self.engine.visual_guard_latched,
         )
         self.screen_detector.start()
 
@@ -1569,7 +1620,19 @@ class App:
         self, blocked: bool, reason: str, mouse_score: float, clock_score: float
     ) -> None:
         self.engine.set_screen_blocked(blocked, reason)
-        self.post_event("guard_state", blocked, reason, mouse_score, clock_score)
+        ignored_for_hold = (
+            blocked
+            and self.engine.physically_held
+            and not self.engine.visual_guard_latched
+        )
+        self.post_event(
+            "guard_state",
+            blocked,
+            reason,
+            mouse_score,
+            clock_score,
+            ignored_for_hold,
+        )
 
     def _on_guard_error(self, text: str) -> None:
         self.engine.set_screen_blocked(False)
