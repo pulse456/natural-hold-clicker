@@ -52,6 +52,13 @@ class RecognitionTests(unittest.TestCase):
         self.assertGreaterEqual(min(positives), THRESH_MOUSE)
         self.assertLess(max(negatives), THRESH_MOUSE - CLEAR_MARGIN)
 
+    def test_middle_mouse_prompt_cannot_trigger_left_icon(self):
+        score = mouse_left_score(
+            gray(SAMPLES / "mouse_ambiguous_middle_prompt_01.png"),
+            self.mouse_templates,
+        )
+        self.assertLess(score, THRESH_MOUSE)
+
     def test_clock_samples_have_a_clear_margin(self):
         positives = [
             best_score(
@@ -76,7 +83,9 @@ class RecognitionTests(unittest.TestCase):
 
 
 class DetectorTransitionTests(unittest.TestCase):
-    def run_sequence(self, clear_frames, scores, is_guard_latched=None):
+    def run_sequence(
+        self, clear_frames, scores, is_guard_latched=None, detect_mouse=True
+    ):
         transitions = []
         resumed = threading.Event()
         instances = []
@@ -120,6 +129,7 @@ class DetectorTransitionTests(unittest.TestCase):
             monitor_factory=FakeMonitor,
             clear_frames=clear_frames,
             is_guard_latched=is_guard_latched,
+            detect_mouse=detect_mouse,
         )
         detector.start()
         try:
@@ -152,6 +162,21 @@ class DetectorTransitionTests(unittest.TestCase):
         ]
         transitions = self.run_sequence(3, scores)
         self.assertEqual(transitions[-1], (False, "", 6))
+
+    def test_clock_only_mode_ignores_mouse_matches(self):
+        scores = [
+            (THRESH_MOUSE + 0.1, THRESH_CLOCK + 0.1),
+            (THRESH_MOUSE + 0.1, 0.0),
+            (THRESH_MOUSE + 0.1, 0.0),
+        ]
+        transitions = self.run_sequence(2, scores, detect_mouse=False)
+        self.assertEqual(
+            transitions,
+            [
+                (True, "背包时钟", 1),
+                (False, "", 3),
+            ],
+        )
 
     def test_guard_cannot_clear_while_engine_latch_is_active(self):
         latched = True

@@ -15,7 +15,7 @@ from PIL import ImageGrab
 REF_W, REF_H = 1920, 1080
 REGION_MOUSE = (1864, 500, 38, 260)
 REGION_CLOCK = (1806, 15, 41, 46)
-THRESH_MOUSE = 0.62
+THRESH_MOUSE = 0.70
 THRESH_CLOCK = 0.50
 CLEAR_MARGIN = 0.08
 DEFAULT_CLEAR_FRAMES = 3
@@ -181,6 +181,7 @@ class VisualStateMonitor:
         assets_dir: Path,
         screen_rect: tuple[int, int, int, int] | None = None,
         capture_backend: str = "auto",
+        detect_mouse: bool = True,
     ) -> None:
         if screen_rect is None:
             user32 = ctypes.windll.user32
@@ -197,6 +198,7 @@ class VisualStateMonitor:
         if abs(height / REF_H - scale) > 0.02:
             raise ValueError(f"当前画面不是受支持的16:9比例: {width}x{height}")
 
+        self.detect_mouse = bool(detect_mouse)
         self.mouse_templates, self.clock_template, self.clock_mask = self._load_templates(
             Path(assets_dir), scale
         )
@@ -204,7 +206,11 @@ class VisualStateMonitor:
         client_clock = scale_region(REGION_CLOCK, scale)
         self.screen_mouse = offset_region(client_mouse, self.ox, self.oy)
         self.screen_clock = offset_region(client_clock, self.ox, self.oy)
-        self.capture_region = enclosing_region(self.screen_mouse, self.screen_clock)
+        self.capture_region = (
+            enclosing_region(self.screen_mouse, self.screen_clock)
+            if self.detect_mouse
+            else self.screen_clock
+        )
         self.grabber = ScreenGrabber(self.capture_region, capture_backend)
 
     @staticmethod
@@ -250,13 +256,15 @@ class VisualStateMonitor:
 
     def check_capture(self, captured: np.ndarray) -> tuple[float, float]:
         capture_x, capture_y, _, _ = self.capture_region
-        mouse_local = offset_region(self.screen_mouse, -capture_x, -capture_y)
         clock_local = offset_region(self.screen_clock, -capture_x, -capture_y)
-        mouse_roi = crop_region(captured, mouse_local, "鼠标左键区域")
         clock_roi = crop_region(captured, clock_local, "时钟区域")
-        mouse_score = mouse_left_score(
-            cv2.cvtColor(mouse_roi, cv2.COLOR_BGR2GRAY), self.mouse_templates
-        )
+        mouse_score = 0.0
+        if self.detect_mouse:
+            mouse_local = offset_region(self.screen_mouse, -capture_x, -capture_y)
+            mouse_roi = crop_region(captured, mouse_local, "鼠标左键区域")
+            mouse_score = mouse_left_score(
+                cv2.cvtColor(mouse_roi, cv2.COLOR_BGR2GRAY), self.mouse_templates
+            )
         clock_score = best_score(
             cv2.cvtColor(clock_roi, cv2.COLOR_BGR2GRAY),
             self.clock_template,
@@ -270,7 +278,7 @@ class VisualStateMonitor:
 
 
 class ScreenStateDetector:
-    """40Hz silent detector that reports whether automatic clicking should be blocked."""
+    """Silent detector that reports whether automatic clicking should be blocked."""
 
     def __init__(
         self,
@@ -283,6 +291,7 @@ class ScreenStateDetector:
         monitor_factory: Callable[..., VisualStateMonitor] = VisualStateMonitor,
         clear_frames: int = DEFAULT_CLEAR_FRAMES,
         is_guard_latched: Callable[[], bool] | None = None,
+        detect_mouse: bool = True,
     ) -> None:
         self.assets_dir = Path(assets_dir)
         self.on_state = on_state
@@ -293,6 +302,7 @@ class ScreenStateDetector:
         self.monitor_factory = monitor_factory
         self.clear_frames = max(1, min(10, int(clear_frames)))
         self.is_guard_latched = is_guard_latched or (lambda: False)
+        self.detect_mouse = bool(detect_mouse)
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
 
@@ -319,16 +329,20 @@ class ScreenStateDetector:
         clear_frames = 0
         try:
             monitor = self.monitor_factory(
-                assets_dir=self.assets_dir, capture_backend=self.capture_backend
+                assets_dir=self.assets_dir,
+                capture_backend=self.capture_backend,
+                detect_mouse=self.detect_mouse,
             )
+            scope = "背包时钟＋技能左键" if self.detect_mouse else "仅背包时钟"
             self.on_status(
-                f"监控中 · {monitor.grabber.name.upper()} · {round(1 / self.interval)} Hz"
+                f"监控中 · {scope} · {monitor.grabber.name.upper()} · "
+                f"{round(1 / self.interval)} Hz"
             )
             while not self._stop.is_set():
                 started = time.perf_counter()
                 frame = monitor.grabber.grab()
                 mouse_score, clock_score = monitor.check_capture(frame)
-                mouse_found = mouse_score >= THRESH_MOUSE
+                mouse_found = self.detect_mouse and mouse_score >= THRESH_MOUSE
                 clock_found = clock_score >= THRESH_CLOCK
 
                 if mouse_found or clock_found:
@@ -352,7 +366,10 @@ class ScreenStateDetector:
                         clear_frames = 0
                     else:
                         clearly_absent = (
-                            mouse_score < THRESH_MOUSE - CLEAR_MARGIN
+                            (
+                                not self.detect_mouse
+                                or mouse_score < THRESH_MOUSE - CLEAR_MARGIN
+                            )
                             and clock_score < THRESH_CLOCK - CLEAR_MARGIN
                         )
                         clear_frames = clear_frames + 1 if clearly_absent else 0

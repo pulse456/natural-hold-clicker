@@ -21,7 +21,8 @@ from screen_state_detector import ScreenStateDetector, make_dpi_aware
 
 
 APP_NAME = "自然长按连点器"
-APP_VERSION = "1.8.0"
+APP_VERSION = "1.9.0"
+DETECTION_HZ_CHOICES = (30, 40, 60)
 INJECTED_MARKER = 0xC0DEC11C
 SINGLE_INSTANCE_MUTEX = "Local\\NaturalHoldClicker.SingleInstance"
 ERROR_ALREADY_EXISTS = 183
@@ -71,6 +72,13 @@ INJECTION_LABELS = {
     "message": "窗口消息模式（旧游戏）",
 }
 LABEL_TO_INJECTION = {label: key for key, label in INJECTION_LABELS.items()}
+SCREEN_GUARD_MODE_LABELS = {
+    "clock_only": "仅检测背包时钟",
+    "clock_mouse": "检测背包时钟＋技能左键",
+}
+LABEL_TO_SCREEN_GUARD_MODE = {
+    label: key for key, label in SCREEN_GUARD_MODE_LABELS.items()
+}
 HOTKEYS = {f"F{i}": 0x6F + i for i in range(6, 12)}
 MAX_PAUSE_BINDINGS = 12
 PAUSE_MIN_MS = 10
@@ -187,6 +195,8 @@ class AppConfig:
     natural_hesitation: bool = False
     sound_enabled: bool = True
     screen_guard_enabled: bool = False
+    screen_guard_mode: str = "clock_mouse"
+    detection_hz: int = 40
     visual_clear_frames: int = 3
     pause_bindings: tuple[tuple[str, int, bool], ...] = ()
     start_enabled: bool = True
@@ -205,6 +215,16 @@ class AppConfig:
             natural_hesitation=bool(self.natural_hesitation),
             sound_enabled=bool(self.sound_enabled),
             screen_guard_enabled=bool(self.screen_guard_enabled),
+            screen_guard_mode=(
+                self.screen_guard_mode
+                if self.screen_guard_mode in SCREEN_GUARD_MODE_LABELS
+                else "clock_mouse"
+            ),
+            detection_hz=(
+                int(self.detection_hz)
+                if int(self.detection_hz) in DETECTION_HZ_CHOICES
+                else 40
+            ),
             visual_clear_frames=max(1, min(10, int(self.visual_clear_frames))),
             pause_bindings=normalized_pause_bindings(self.pause_bindings),
             start_enabled=bool(self.start_enabled),
@@ -483,6 +503,24 @@ def is_running_as_admin() -> bool:
         return False
 
 
+def shell_execute_as_independent_admin(executable: str, parameters: str | None) -> int:
+    """Start an elevated frozen-app restart without reusing its onefile _MEI tree."""
+    variable = "PYINSTALLER_RESET_ENVIRONMENT"
+    previous = os.environ.get(variable)
+    os.environ[variable] = "1"
+    try:
+        return int(
+            ctypes.windll.shell32.ShellExecuteW(
+                None, "runas", executable, parameters, str(Path.cwd()), 1
+            )
+        )
+    finally:
+        if previous is None:
+            os.environ.pop(variable, None)
+        else:
+            os.environ[variable] = previous
+
+
 class SingleInstanceGuard:
     def __init__(self, name: str = SINGLE_INSTANCE_MUTEX) -> None:
         self.handle = None
@@ -509,6 +547,7 @@ class ClickEngine:
         self._cancel = threading.Event()
         self._rhythm = HumanRhythm()
         self._worker: threading.Thread | None = None
+        self._active_click_token: int | None = None
         self._physical_presses = 0
         self._generated_clicks = 0
         self._screen_blocked = False
@@ -828,6 +867,7 @@ class ClickEngine:
         cancel_event: threading.Event,
         pressed_at: float,
     ) -> None:
+        clicking_started = False
         if initial_config.activation_mode == "stable":
             confirmation_delay = initial_config.hold_threshold_ms / 1000.0
         else:  # progressive
@@ -849,7 +889,13 @@ class ClickEngine:
             else:
                 if cancel_event.wait(0.005) or not self._still_active(token):
                     return
+            with self._lock:
+                if not self._still_active(token):
+                    return
+                self._active_click_token = token
+            clicking_started = True
             self._notify("clicking")
+            self._notify("interrupt", token, "运行中：本次按住已锁定连点")
 
             progressive_started = time.perf_counter()
             while self._still_active(token):
@@ -891,6 +937,22 @@ class ClickEngine:
                         initial_config.injection_mode,
                         target_window,
                     )
+            if clicking_started:
+                with self._lock:
+                    blocked, block_reason = self._block_snapshot_locked()
+                    if self._active_click_token == token:
+                        self._active_click_token = None
+                    if not self._physically_held:
+                        stop_reason = "停止原因：检测到物理鼠标松开"
+                    elif not self._enabled:
+                        stop_reason = "停止原因：脚本被 F8、F12 或界面按钮暂停"
+                    elif blocked:
+                        stop_reason = f"停止原因：{block_reason}"
+                    elif token != self._press_token:
+                        stop_reason = "停止原因：输入状态或设置发生重置"
+                    else:
+                        stop_reason = "停止原因：点击任务异常结束"
+                self._notify("interrupt", token, stop_reason)
 
 class GlobalInputMonitor:
     def __init__(self, engine: ClickEngine, notify) -> None:
@@ -1182,6 +1244,10 @@ class App:
         self.hesitation_var = tk.BooleanVar(value=self.config.natural_hesitation)
         self.sound_var = tk.BooleanVar(value=self.config.sound_enabled)
         self.screen_guard_var = tk.BooleanVar(value=self.config.screen_guard_enabled)
+        self.screen_guard_mode_var = tk.StringVar(
+            value=SCREEN_GUARD_MODE_LABELS[self.config.screen_guard_mode]
+        )
+        self.detection_hz_var = tk.StringVar(value=f"{self.config.detection_hz} Hz")
         self.visual_clear_frames_var = tk.StringVar(value=str(self.config.visual_clear_frames))
         self.start_var = tk.BooleanVar(value=self.config.start_enabled)
 
@@ -1224,13 +1290,45 @@ class App:
             settings,
             7,
             "图标消失确认",
-            "两种图标连续未检出多少帧后恢复；推荐 3",
+            "所选图标连续未检出多少帧后恢复；推荐 3",
             self._spin(settings, self.visual_clear_frames_var, 1, 10, 1),
             "帧",
         )
 
+        detection_hz_box = ttk.Combobox(
+            settings,
+            textvariable=self.detection_hz_var,
+            values=[f"{value} Hz" for value in DETECTION_HZ_CHOICES],
+            state="readonly",
+            width=13,
+        )
+        self._setting_row(
+            settings,
+            8,
+            "界面检测频率",
+            "30 Hz 省资源；40 Hz 平衡；60 Hz 响应最快",
+            detection_hz_box,
+            "",
+        )
+
+        screen_guard_mode_box = ttk.Combobox(
+            settings,
+            textvariable=self.screen_guard_mode_var,
+            values=list(SCREEN_GUARD_MODE_LABELS.values()),
+            state="readonly",
+            width=22,
+        )
+        self._setting_row(
+            settings,
+            9,
+            "界面检测内容",
+            "可只检测背包，或同时保护技能按住操作",
+            screen_guard_mode_box,
+            "",
+        )
+
         options = ttk.Frame(settings, style="Card.TFrame")
-        options.grid(row=8, column=0, columnspan=4, sticky="ew", pady=(14, 0))
+        options.grid(row=10, column=0, columnspan=4, sticky="ew", pady=(14, 0))
         ttk.Checkbutton(options, text="自然节奏漂移（相邻点击轻微关联）", variable=self.natural_var).pack(anchor="w")
         ttk.Checkbutton(
             options,
@@ -1240,7 +1338,7 @@ class App:
         ttk.Checkbutton(options, text="状态提示音（开启升调、暂停降调）", variable=self.sound_var).pack(anchor="w", pady=(5, 0))
         ttk.Checkbutton(
             options,
-            text="识别背包时钟 / 技能鼠标图标时静默暂停连点（40 Hz）",
+            text="启用界面图标检测并静默暂停连点（按所选内容和频率）",
             variable=self.screen_guard_var,
         ).pack(anchor="w", pady=(5, 0))
         ttk.Checkbutton(options, text="下次启动时自动启用", variable=self.start_var).pack(anchor="w", pady=(5, 0))
@@ -1281,6 +1379,14 @@ class App:
             style="Subtitle.TLabel",
         )
         self.stats_label.pack(anchor="w", pady=(13, 0))
+
+        self._diagnostic_token = -1
+        self.interrupt_label = ttk.Label(
+            outer,
+            text="连点诊断：尚未进入连续点击",
+            style="Subtitle.TLabel",
+        )
+        self.interrupt_label.pack(anchor="w", pady=(5, 0))
 
         self.guard_label = ttk.Label(
             outer,
@@ -1329,6 +1435,11 @@ class App:
                     self.stats_label.configure(
                         text=f"输入诊断：检测到 {args[0]} 次物理按下 · 已生成 {args[1]} 次点击"
                     )
+                elif name == "interrupt":
+                    token, detail = int(args[0]), str(args[1])
+                    if token >= self._diagnostic_token:
+                        self._diagnostic_token = token
+                        self.interrupt_label.configure(text=f"连点诊断：{detail}")
                 elif name == "sound":
                     self.sound_player.play(args[0])
                 elif name == "error":
@@ -1343,11 +1454,13 @@ class App:
                         text = f"已静默暂停 · {reason}"
                     else:
                         text = "监控中 · 未发现阻断图标"
+                    score_text = (
+                        f"时钟 {clock_score:.3f}"
+                        if self.config.screen_guard_mode == "clock_only"
+                        else f"鼠标 {mouse_score:.3f} / 时钟 {clock_score:.3f}"
+                    )
                     self.guard_label.configure(
-                        text=(
-                            f"界面检测：{text}"
-                            f"（鼠标 {mouse_score:.3f} / 时钟 {clock_score:.3f}）"
-                        )
+                        text=f"界面检测：{text}（{score_text}）"
                     )
                 elif name == "guard_error":
                     self.guard_label.configure(text=f"界面检测：已停止 · {args[0]}")
@@ -1540,6 +1653,10 @@ class App:
                 natural_hesitation=self.hesitation_var.get(),
                 sound_enabled=self.sound_var.get(),
                 screen_guard_enabled=self.screen_guard_var.get(),
+                screen_guard_mode=LABEL_TO_SCREEN_GUARD_MODE[
+                    self.screen_guard_mode_var.get()
+                ],
+                detection_hz=int(self.detection_hz_var.get().split()[0]),
                 visual_clear_frames=int(self.visual_clear_frames_var.get()),
                 pause_bindings=tuple(pause_bindings),
                 start_enabled=self.start_var.get(),
@@ -1558,6 +1675,8 @@ class App:
 
         old_hotkey = self.config.toggle_hotkey
         old_screen_guard = self.config.screen_guard_enabled
+        old_screen_guard_mode = self.config.screen_guard_mode
+        old_detection_hz = self.config.detection_hz
         old_visual_clear_frames = self.config.visual_clear_frames
         self.config = validated
         self.engine.update_config(validated)
@@ -1571,6 +1690,10 @@ class App:
         self.cpm_var.set(str(validated.clicks_per_minute))
         self.jitter_var.set(f"{validated.jitter_percent:g}")
         self.threshold_var.set(str(validated.hold_threshold_ms))
+        self.screen_guard_mode_var.set(
+            SCREEN_GUARD_MODE_LABELS[validated.screen_guard_mode]
+        )
+        self.detection_hz_var.set(f"{validated.detection_hz} Hz")
         self.visual_clear_frames_var.set(str(validated.visual_clear_frames))
         self._replace_pause_rule_rows(validated.pause_bindings)
         if old_screen_guard != validated.screen_guard_enabled:
@@ -1578,6 +1701,12 @@ class App:
                 self._start_screen_detector()
             else:
                 self._stop_screen_detector()
+        elif validated.screen_guard_enabled and (
+            old_detection_hz != validated.detection_hz
+            or old_screen_guard_mode != validated.screen_guard_mode
+        ):
+            self._stop_screen_detector()
+            self._start_screen_detector()
         elif (
             validated.screen_guard_enabled
             and old_visual_clear_frames != validated.visual_clear_frames
@@ -1603,8 +1732,10 @@ class App:
             self._on_guard_state,
             lambda text: self.post_event("guard_status", text),
             self._on_guard_error,
+            interval=1.0 / self.config.detection_hz,
             clear_frames=self.config.visual_clear_frames,
             is_guard_latched=lambda: self.engine.visual_guard_latched,
+            detect_mouse=self.config.screen_guard_mode == "clock_mouse",
         )
         self.screen_detector.start()
 
@@ -1648,9 +1779,7 @@ class App:
         # Release the single-instance lock before starting the elevated replacement.
         if self.instance_guard:
             self.instance_guard.close()
-        result = ctypes.windll.shell32.ShellExecuteW(
-            None, "runas", executable, parameters, str(Path.cwd()), 1
-        )
+        result = shell_execute_as_independent_admin(executable, parameters)
         if result > 32:
             self.close()
         else:

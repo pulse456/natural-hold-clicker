@@ -1,3 +1,4 @@
+import os
 import random
 import threading
 import time
@@ -14,6 +15,7 @@ from human_clicker import (
     binding_conflict_message,
     input_code_label,
     normalized_pause_bindings,
+    shell_execute_as_independent_admin,
 )
 
 
@@ -31,6 +33,13 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.jitter_percent, 0)
         self.assertEqual(config.hold_threshold_ms, 30)
         self.assertEqual(config.visual_clear_frames, 10)
+        self.assertEqual(config.detection_hz, 40)
+        self.assertEqual(AppConfig(detection_hz=60).validated().detection_hz, 60)
+        self.assertEqual(config.screen_guard_mode, "clock_mouse")
+        self.assertEqual(
+            AppConfig(screen_guard_mode="clock_only").validated().screen_guard_mode,
+            "clock_only",
+        )
         self.assertFalse(config.natural_hesitation)
         self.assertEqual(config.activation_mode, "stable")
         self.assertEqual(config.injection_mode, "sendinput")
@@ -128,6 +137,32 @@ class ActivationModeTests(unittest.TestCase):
             self.assertTrue(clicked.wait(0.15))
             engine.physical_up("left")
             engine._worker.join(timeout=0.5)
+
+    def test_diagnostic_reports_physical_release_after_clicking(self):
+        events = []
+        clicking = threading.Event()
+        engine = ClickEngine(
+            AppConfig(
+                activation_mode="stable",
+                hold_threshold_ms=30,
+                clicks_per_minute=600,
+                jitter_percent=0,
+                natural_rhythm=False,
+            ),
+            lambda *args: (events.append(args), clicking.set())
+            if args[0] == "clicking"
+            else events.append(args),
+        )
+
+        with patch("human_clicker.send_button_event", return_value=True):
+            engine.physical_down("left")
+            self.assertTrue(clicking.wait(0.15))
+            engine.physical_up("left")
+            engine._worker.join(timeout=0.5)
+
+        diagnostics = [event[2] for event in events if event[0] == "interrupt"]
+        self.assertIn("运行中：本次按住已锁定连点", diagnostics)
+        self.assertEqual(diagnostics[-1], "停止原因：检测到物理鼠标松开")
 
 
 class ScreenGuardTests(unittest.TestCase):
@@ -319,6 +354,25 @@ class SingleInstanceTests(unittest.TestCase):
         finally:
             second.close()
             first.close()
+
+
+class FrozenRestartTests(unittest.TestCase):
+    def test_admin_restart_marks_new_instance_as_independent(self):
+        variable = "PYINSTALLER_RESET_ENVIRONMENT"
+        previous = os.environ.pop(variable, None)
+        observed = []
+        try:
+            def fake_shell_execute(*_args):
+                observed.append(os.environ.get(variable))
+                return 33
+
+            with patch("human_clicker.ctypes.windll.shell32.ShellExecuteW", side_effect=fake_shell_execute):
+                self.assertEqual(shell_execute_as_independent_admin("app.exe", None), 33)
+            self.assertEqual(observed, ["1"])
+            self.assertNotIn(variable, os.environ)
+        finally:
+            if previous is not None:
+                os.environ[variable] = previous
 
 
 if __name__ == "__main__":
