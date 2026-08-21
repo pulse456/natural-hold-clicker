@@ -21,7 +21,7 @@ from screen_state_detector import ScreenStateDetector, make_dpi_aware
 
 
 APP_NAME = "自然长按连点器"
-APP_VERSION = "1.6.0"
+APP_VERSION = "1.7.0"
 INJECTED_MARKER = 0xC0DEC11C
 SINGLE_INSTANCE_MUTEX = "Local\\NaturalHoldClicker.SingleInstance"
 ERROR_ALREADY_EXISTS = 183
@@ -519,6 +519,11 @@ class ClickEngine:
         with self._lock:
             return self._block_snapshot_locked()
 
+    @property
+    def physically_held(self) -> bool:
+        with self._lock:
+            return self._physically_held
+
     def update_config(self, config: AppConfig) -> None:
         pause_bindings_changed = False
         with self._lock:
@@ -792,46 +797,58 @@ class ClickEngine:
         if cancel_event.wait(confirmation_delay) or not self._still_active(token):
             return
 
-        send_button_event(
+        native_released = send_button_event(
             initial_config.trigger_button, False, initial_config.injection_mode, target_window
         )  # Release the native held state before generating clicks.
-
-        if initial_config.activation_mode == "progressive":
-            base_interval = 60.0 / initial_config.clicks_per_minute
-            first_repeat_at = max(confirmation_delay + 0.008, base_interval * 1.60)
-            remaining = max(0.0, first_repeat_at - (time.perf_counter() - pressed_at))
-            if cancel_event.wait(remaining) or not self._still_active(token):
-                return
-        else:
-            if cancel_event.wait(0.005) or not self._still_active(token):
-                return
-        self._notify("clicking")
-
-        progressive_started = time.perf_counter()
-        while self._still_active(token):
-            started = time.perf_counter()
-            config = self.config
-            interval = self._rhythm.next_interval(
-                config.clicks_per_minute, config.jitter_percent, config.natural_rhythm
-            )
+        try:
             if initial_config.activation_mode == "progressive":
-                ramp = max(0.0, 1.0 - (started - progressive_started) / 0.350)
-                interval *= 1.0 + 0.65 * ramp
-            sent = send_button_event(
-                initial_config.trigger_button, True, initial_config.injection_mode, target_window
-            )
-            if sent:
-                self._record_generated_click()
-            hold_time = self._rhythm.click_hold_time(interval, config.natural_rhythm)
-            cancelled = cancel_event.wait(hold_time)
-            send_button_event(
-                initial_config.trigger_button, False, initial_config.injection_mode, target_window
-            )  # Always release, even when paused mid-click.
-            if cancelled or not self._still_active(token):
-                break
-            remaining = max(0.0, interval - (time.perf_counter() - started))
-            if cancel_event.wait(remaining):
-                break
+                base_interval = 60.0 / initial_config.clicks_per_minute
+                first_repeat_at = max(confirmation_delay + 0.008, base_interval * 1.60)
+                remaining = max(0.0, first_repeat_at - (time.perf_counter() - pressed_at))
+                if cancel_event.wait(remaining) or not self._still_active(token):
+                    return
+            else:
+                if cancel_event.wait(0.005) or not self._still_active(token):
+                    return
+            self._notify("clicking")
+
+            progressive_started = time.perf_counter()
+            while self._still_active(token):
+                started = time.perf_counter()
+                config = self.config
+                interval = self._rhythm.next_interval(
+                    config.clicks_per_minute, config.jitter_percent, config.natural_rhythm
+                )
+                if initial_config.activation_mode == "progressive":
+                    ramp = max(0.0, 1.0 - (started - progressive_started) / 0.350)
+                    interval *= 1.0 + 0.65 * ramp
+                sent = send_button_event(
+                    initial_config.trigger_button, True, initial_config.injection_mode, target_window
+                )
+                if sent:
+                    self._record_generated_click()
+                hold_time = self._rhythm.click_hold_time(interval, config.natural_rhythm)
+                cancelled = cancel_event.wait(hold_time)
+                send_button_event(
+                    initial_config.trigger_button, False, initial_config.injection_mode, target_window
+                )  # Always release, even when paused mid-click.
+                if cancelled or not self._still_active(token):
+                    break
+                remaining = max(0.0, interval - (time.perf_counter() - started))
+                if cancel_event.wait(remaining):
+                    break
+        finally:
+            if native_released:
+                with self._lock:
+                    blocked, _reason = self._block_snapshot_locked()
+                    restore_hold = self._enabled and blocked and self._physically_held
+                if restore_hold:
+                    send_button_event(
+                        initial_config.trigger_button,
+                        True,
+                        initial_config.injection_mode,
+                        target_window,
+                    )
 
 class GlobalInputMonitor:
     def __init__(self, engine: ClickEngine, notify) -> None:
@@ -1536,6 +1553,7 @@ class App:
             lambda text: self.post_event("guard_status", text),
             self._on_guard_error,
             clear_frames=self.config.visual_clear_frames,
+            is_trigger_held=lambda: self.engine.physically_held,
         )
         self.screen_detector.start()
 

@@ -50,11 +50,18 @@ def best_match(gray_roi, templates):
     return best_score, best_location, best_shape
 
 
-def import_samples(screenshots: list[Path]) -> None:
+def import_samples(
+    screenshots: list[Path],
+    series: str = "character2",
+    template_name: str = "template_mouse_left_5.png",
+) -> None:
     templates = [
         gradient_map(read_gray(ROOT / "assets" / filename))
         for filename in MOUSE_TEMPLATE_FILES
+        if (ROOT / "assets" / filename).exists()
     ]
+    if not templates:
+        raise RuntimeError("没有可用的鼠标左键模板")
     x, y, width, height = REGION_MOUSE
     candidates = []
     for index, screenshot in enumerate(screenshots, 1):
@@ -63,14 +70,14 @@ def import_samples(screenshots: list[Path]) -> None:
             raise ValueError(f"截图尺寸不足: {screenshot} ({gray.shape[1]}x{gray.shape[0]})")
         roi = gray[y : y + height, x : x + width]
         score, location, shape = best_match(roi, templates)
-        output = ROOT / "detector_test_samples" / f"mouse_pos_character2_{index:02}.png"
+        output = ROOT / "detector_test_samples" / f"mouse_pos_{series}_{index:02}.png"
         write_png(output, roi)
         candidates.append((score, location, shape, roi, screenshot.name))
         print(f"{screenshot.name}: score={score:.4f}, location=({x + location[0]}, {y + location[1]})")
 
     score, (match_x, match_y), (template_h, template_w), roi, source = min(candidates)
     template = roi[match_y : match_y + template_h, match_x : match_x + template_w]
-    output = ROOT / "assets" / "template_mouse_left_5.png"
+    output = ROOT / "assets" / template_name
     write_png(output, template)
     print(f"新增模板: {output.name}, source={source}, previous_score={score:.4f}")
 
@@ -78,8 +85,12 @@ def import_samples(screenshots: list[Path]) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("screenshots", nargs="+", type=Path)
+    parser.add_argument("--series", default="character2")
+    parser.add_argument("--template-name", default="template_mouse_left_5.png")
     args = parser.parse_args()
-    import_samples(args.screenshots)
+    if Path(args.template_name).name != args.template_name or not args.template_name.endswith(".png"):
+        parser.error("--template-name 必须是 assets 目录内的 PNG 文件名")
+    import_samples(args.screenshots, args.series, args.template_name)
 
 
 if __name__ == "__main__":

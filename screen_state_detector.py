@@ -25,6 +25,7 @@ MOUSE_TEMPLATE_FILES = (
     "template_mouse_left_3.png",
     "template_mouse_left_4.png",
     "template_mouse_left_5.png",
+    "template_mouse_left_6.png",
 )
 
 
@@ -281,6 +282,7 @@ class ScreenStateDetector:
         capture_backend: str = "auto",
         monitor_factory: Callable[..., VisualStateMonitor] = VisualStateMonitor,
         clear_frames: int = DEFAULT_CLEAR_FRAMES,
+        is_trigger_held: Callable[[], bool] | None = None,
     ) -> None:
         self.assets_dir = Path(assets_dir)
         self.on_state = on_state
@@ -290,6 +292,7 @@ class ScreenStateDetector:
         self.capture_backend = capture_backend
         self.monitor_factory = monitor_factory
         self.clear_frames = max(1, min(10, int(clear_frames)))
+        self.is_trigger_held = is_trigger_held or (lambda: False)
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
 
@@ -341,16 +344,23 @@ class ScreenStateDetector:
                         blocked_reason = reason
                         self.on_state(True, reason, mouse_score, clock_score)
                 elif blocked:
-                    clearly_absent = (
-                        mouse_score < THRESH_MOUSE - CLEAR_MARGIN
-                        and clock_score < THRESH_CLOCK - CLEAR_MARGIN
-                    )
-                    clear_frames = clear_frames + 1 if clearly_absent else 0
-                    if clear_frames >= self.clear_frames:
-                        blocked = False
-                        blocked_reason = ""
+                    # A transient miss must never re-arm automatic clicking while
+                    # the user is still physically holding the trigger. Positive
+                    # detections remain active above, so icons that appear only
+                    # after mouse-down can still enter the guarded state.
+                    if self.is_trigger_held():
                         clear_frames = 0
-                        self.on_state(False, "", mouse_score, clock_score)
+                    else:
+                        clearly_absent = (
+                            mouse_score < THRESH_MOUSE - CLEAR_MARGIN
+                            and clock_score < THRESH_CLOCK - CLEAR_MARGIN
+                        )
+                        clear_frames = clear_frames + 1 if clearly_absent else 0
+                        if clear_frames >= self.clear_frames:
+                            blocked = False
+                            blocked_reason = ""
+                            clear_frames = 0
+                            self.on_state(False, "", mouse_score, clock_score)
 
                 elapsed = time.perf_counter() - started
                 self._stop.wait(max(0.0, self.interval - elapsed))

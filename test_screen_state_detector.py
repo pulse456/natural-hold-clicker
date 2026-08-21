@@ -76,7 +76,7 @@ class RecognitionTests(unittest.TestCase):
 
 
 class DetectorTransitionTests(unittest.TestCase):
-    def run_sequence(self, clear_frames, scores):
+    def run_sequence(self, clear_frames, scores, is_trigger_held=None):
         transitions = []
         resumed = threading.Event()
         instances = []
@@ -119,6 +119,7 @@ class DetectorTransitionTests(unittest.TestCase):
             interval=0.010,
             monitor_factory=FakeMonitor,
             clear_frames=clear_frames,
+            is_trigger_held=is_trigger_held,
         )
         detector.start()
         try:
@@ -151,6 +152,63 @@ class DetectorTransitionTests(unittest.TestCase):
         ]
         transitions = self.run_sequence(3, scores)
         self.assertEqual(transitions[-1], (False, "", 6))
+
+    def test_guard_cannot_clear_until_physical_trigger_is_released(self):
+        held = True
+
+        def is_trigger_held():
+            return held
+
+        transitions = []
+        resumed = threading.Event()
+
+        class FakeGrabber:
+            name = "fake"
+
+            @staticmethod
+            def grab():
+                return object()
+
+        class FakeMonitor:
+            def __init__(self, **_kwargs):
+                self.grabber = FakeGrabber()
+                self.calls = 0
+
+            def check_capture(self, _frame):
+                self.calls += 1
+                return (THRESH_MOUSE + 0.1, 0.0) if self.calls == 1 else (0.0, 0.0)
+
+            @staticmethod
+            def close():
+                pass
+
+        def on_state(blocked, reason, *_scores):
+            transitions.append((blocked, reason))
+            if not blocked:
+                resumed.set()
+
+        detector = ScreenStateDetector(
+            ASSETS,
+            on_state,
+            lambda _text: None,
+            lambda error: transitions.append(("error", error)),
+            interval=0.010,
+            monitor_factory=FakeMonitor,
+            clear_frames=2,
+            is_trigger_held=is_trigger_held,
+        )
+        detector.start()
+        try:
+            self.assertTrue(detector._thread)
+            self.assertFalse(resumed.wait(0.08))
+            held = False
+            self.assertTrue(resumed.wait(0.15))
+        finally:
+            detector.stop()
+        self.assertEqual(
+            transitions,
+            [(True, "技能鼠标图标"), (False, "")],
+        )
 
 
 if __name__ == "__main__":

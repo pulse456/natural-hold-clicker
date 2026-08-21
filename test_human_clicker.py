@@ -159,6 +159,33 @@ class ScreenGuardTests(unittest.TestCase):
             engine.physical_up("left")
             engine._worker.join(timeout=0.5)
 
+    def test_late_guard_restores_continuous_physical_hold(self):
+        initial_release = threading.Event()
+        sent_states = []
+        engine = ClickEngine(
+            AppConfig(
+                activation_mode="progressive",
+                clicks_per_minute=60,
+                start_enabled=True,
+            ),
+            lambda *args: None,
+        )
+
+        def send(_button, down, *_args):
+            sent_states.append(down)
+            if not down:
+                initial_release.set()
+            return True
+
+        with patch("human_clicker.send_button_event", side_effect=send):
+            engine.physical_down("left")
+            self.assertTrue(initial_release.wait(0.15))
+            engine.set_screen_blocked(True, "技能鼠标图标")
+            engine._worker.join(timeout=0.5)
+            self.assertEqual(sent_states, [False, True])
+            self.assertTrue(engine.physically_held)
+            engine.physical_up("left")
+
 
 class KeyPauseTests(unittest.TestCase):
     def test_key_pause_is_silent_and_clears_automatically(self):
